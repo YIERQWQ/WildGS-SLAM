@@ -174,6 +174,7 @@ class FactorGraph:
     def rm_keyframe(self, ix):
         """ drop edges from factor graph """
         with self.video.get_lock():
+            self.video.frame_ids[ix] = self.video.frame_ids[ix+1]
             self.video.timestamp[ix] = self.video.timestamp[ix+1]
             self.video.images[ix] = self.video.images[ix+1]
             self.video.dirty[ix] = self.video.dirty[ix+1]
@@ -194,9 +195,13 @@ class FactorGraph:
             self.video.inps[ix] = self.video.inps[ix+1]
             self.video.fmaps[ix] = self.video.fmaps[ix+1]
 
-            if self.video.uncertainty_aware:
+            if self.video.dino_feats is not None:
                 self.video.dino_feats[ix] = self.video.dino_feats[ix+1]
-                self.video.uncertainties_inv[ix] = self.video.uncertainties_inv[ix+1]
+                self.video.dino_feats_resize[ix] = self.video.dino_feats_resize[ix+1]
+                self.video.dino_feats_valid[ix] = self.video.dino_feats_valid[ix+1]
+            self.video.external_beta[ix] = self.video.external_beta[ix+1]
+            self.video.external_beta_valid[ix] = self.video.external_beta_valid[ix+1]
+            self.video.uncertainties_inv[ix] = self.video.uncertainties_inv[ix+1]
 
         m = (self.ii_inac == ix) | (self.jj_inac == ix)
         self.ii_inac[self.ii_inac >= ix] -= 1

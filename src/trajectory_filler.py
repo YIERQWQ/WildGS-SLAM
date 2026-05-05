@@ -28,7 +28,10 @@ class PoseTrajectoryFiller:
         self.MEAN = torch.tensor([0.485, 0.456, 0.406], device=device)[:, None, None]
         self.STDV = torch.tensor([0.229, 0.224, 0.225], device=device)[:, None, None]
 
-        self.uncertainty_aware = cfg['tracking']["uncertainty_params"]['activate']        
+        self.uncertainty_aware = (
+            cfg['tracking']["uncertainty_params"]['activate']
+            or cfg['mapping']["uncertainty_params"]['activate']
+        )
         
     def setup_feature_extractor(self):
         if self.uncertainty_aware:

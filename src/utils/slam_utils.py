@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import torch
 from torch import Tensor
 from torch.nn import Module
@@ -149,11 +149,11 @@ def get_loss_mapping_uncertainty(
     rendered_depth: Tensor,
     viewpoint, # from src.utils.camera_utils import Camera, to avoid loop import
     opacity: Tensor,
-    uncertainty_network: Module,
     train_frac: float,
     ssim_frac: float,
     initialization: bool = False,
     freeze_uncertainty_loss: bool = False,  # Renamed parameter
+    uncertainty_override: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Compute mapping loss with uncertainty estimation for SLAM system.
     
@@ -166,7 +166,6 @@ def get_loss_mapping_uncertainty(
         rendered_depth: Rendered depth map (1, H, W)
         viewpoint: Camera containing ground truth image and reference depth
         opacity: Rendering opacity mask (1, H, W)
-        uncertainty_network: MLP for uncertainty prediction
         train_frac: Training progress (0-1) for adaptive weighting
         ssim_frac: SSIM loss weight fraction
         initialization: If True, skip exposure compensation
@@ -199,9 +198,12 @@ def get_loss_mapping_uncertainty(
     # Compute SSIM loss if enabled
     ssim_loss = 1.0 - ssim(rendered_img, gt_img) if config["Training"]["ssim_loss"] else 0.0
 
-    # Predict uncertainty from features
-    features = viewpoint.features.to(device=rendered_img.device)
-    uncertainty = uncertainty_network(features)
+    if uncertainty_override is None:
+        raise RuntimeError(
+            "Missing DINOv3 beta for mapping loss. "
+            "beta must be provided by the external service."
+        )
+    uncertainty = uncertainty_override.to(device=rendered_img.device)
 
      # Compute mapping losses with uncertainty
     uncer_loss, uncer_resized, l1_rgb, l1_depth = map_utils.compute_mapping_loss_components(

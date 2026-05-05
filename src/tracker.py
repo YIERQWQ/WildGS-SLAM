@@ -27,6 +27,7 @@ class Tracker:
         self.ba_freq = self.cfg['tracking']['backend']['ba_freq']
 
         self.printer:Printer = slam.printer
+        self.beta_client = getattr(slam, "beta_client", None)
 
     def run(self, stream:BaseDataset):
         '''
@@ -47,6 +48,8 @@ class Tracker:
         for i in range(len(stream)):
             timestamp, image, _, _ = stream[i]
             with torch.no_grad():
+                if self.beta_client is not None:
+                    self.beta_client.drain_results(max_items=32)
                 starting_count = self.video.counter.value
                 ### check there is enough motion
                 force_to_add_keyframe = self.motion_filter.track(timestamp, image, intrinsic)
@@ -58,6 +61,21 @@ class Tracker:
                     if self.motion_filter.uncertainty_aware:
                         img_full = stream.get_color_full_resol(i)
                         self.motion_filter.get_img_feature(timestamp,img_full,suffix='full')
+                if self.beta_client is not None and self.video.counter.value > starting_count:
+                    new_idx = self.video.counter.value - 1
+                    frame_id = int(self.video.frame_ids[new_idx].item())
+                    if not self.video.external_beta_valid[new_idx]:
+                        submitted = self.beta_client.submit(
+                            frame_id=frame_id,
+                            video_idx=new_idx,
+                            image=image,
+                            intrinsics=intrinsic,
+                        )
+                        if not submitted and self.verbose:
+                            self.printer.print(
+                                f"Beta queue full, skip frame {frame_id}",
+                                FontColor.TRACKER,
+                            )
             curr_kf_idx = self.video.counter.value - 1
             
             if curr_kf_idx != prev_kf_idx and self.frontend.is_initialized:
@@ -86,6 +104,9 @@ class Tracker:
         self.pipe.send({"is_keyframe":True, "video_idx":None,
                         "timestamp":None, "just_initialized": False, 
                         "end":True})
+
+        if self.beta_client is not None:
+            self.beta_client.drain_results(max_items=256)
 
 
                 

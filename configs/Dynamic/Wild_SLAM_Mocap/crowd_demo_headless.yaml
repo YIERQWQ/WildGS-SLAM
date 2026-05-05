@@ -6,6 +6,18 @@ gui: False
 mapping:
   online_plotting: False
 
+beta_service:
+  activate: True
+  host: 127.0.0.1
+  port: 5555
+  authkey: wildgs-beta
+  timeout_s: 180.0
+  jpeg_quality: 90
+
+mono_prior:
+  # DINOv3 small backbone; set DINOV3_WEIGHTS before running.
+  feature_extractor: dinov3_vits16
+
 data:
   input_folder: ROOT_FOLDER_PLACEHOLDER/scene1/crowd
   output: ./output/Wild_SLAM_Mocap_demo_headless

@@ -1,3 +1,6 @@
+import os
+import time
+from bisect import bisect_left
 import numpy as np
 import torch
 import lietorch
@@ -6,17 +9,19 @@ import src.geom.ba
 from torch.multiprocessing import Value
 from torch.multiprocessing import Lock
 import torch.nn.functional as F
+from typing import Optional
 
 from src.modules.droid_net import cvx_upsample
 import src.geom.projective_ops as pops
 from src.utils.common import align_scale_and_shift
 from src.utils.Printer import FontColor
 from src.utils.dyn_uncertainty import mapping_utils as map_utils
+from src.utils.external_beta import decode_beta_payload
 
 class DepthVideo:
     ''' store the estimated poses and depth maps, 
         shared between tracker and mapper '''
-    def __init__(self, cfg, printer, uncer_network=None):
+    def __init__(self, cfg, printer, beta_client=None):
         self.cfg =cfg
         self.output = f"{cfg['data']['output']}/{cfg['scene']}"
         ht = cfg['cam']['H_out']
@@ -32,10 +37,12 @@ class DepthVideo:
         self.mono_thres = cfg['tracking']['mono_thres']
         self.device = cfg['device']
         self.down_scale = 8
+        self.feature_stride = 16 if "dinov3" in cfg["mono_prior"]["feature_extractor"] else 14
         self.slice_h = slice(self.down_scale // 2 - 1, ht//self.down_scale*self.down_scale+1, self.down_scale)
         self.slice_w = slice(self.down_scale // 2 - 1, wd//self.down_scale*self.down_scale+1, self.down_scale)
         ### state attributes ###
         self.timestamp = torch.zeros(buffer, device=self.device, dtype=torch.float).share_memory_()
+        self.frame_ids = torch.full((buffer,), -1, device=self.device, dtype=torch.int32).share_memory_()
         # To save gpu ram, we put images to cpu as it is never used
         self.images = torch.zeros(buffer, 3, ht, wd, device='cpu', dtype=torch.float32)
 
@@ -64,73 +71,462 @@ class DepthVideo:
         # initialize poses to identity transformation
         self.poses[:] = torch.as_tensor([0, 0, 0, 0, 0, 0, 1], dtype=torch.float, device=self.device)
         self.printer = printer
+        self.beta_client = beta_client
         
-        self.uncertainty_aware = cfg['tracking']["uncertainty_params"]['activate']
-        self.uncer_network = uncer_network
+        self.uncertainty_aware = (
+            cfg['tracking']["uncertainty_params"]['activate']
+            or cfg['mapping']["uncertainty_params"]['activate']
+        )
+        self.feature_output_dir = os.path.join(self.output, "mono_priors", "features")
+        self.beta_output_dir = os.path.join(self.output, "mono_priors", "betas")
+        os.makedirs(self.feature_output_dir, exist_ok=True)
+        os.makedirs(self.beta_output_dir, exist_ok=True)
         if self.uncertainty_aware:
             n_features = self.cfg["mapping"]["uncertainty_params"]['feature_dim']
             
-            # This check is to ensure the size of self.dino_feats
-            if self.cfg["mono_prior"]["feature_extractor"] not in ["dinov2_reg_small_fine", "dinov2_small_fine","dinov2_vits14", "dinov2_vits14_reg"]:
-                raise ValueError("You are using a new feature extractor, make sure the downsample factor is 14")
-            
             # The followings are in cpu to save memory
-            self.dino_feats = torch.zeros(buffer, ht//14, wd//14, n_features, device='cpu', dtype=torch.float).share_memory_()
+            self.dino_feats = torch.zeros(
+                buffer,
+                ht // self.feature_stride,
+                wd // self.feature_stride,
+                n_features,
+                device='cpu',
+                dtype=torch.float,
+            ).share_memory_()
             self.dino_feats_resize = torch.zeros(buffer, n_features, ht//self.down_scale, wd//self.down_scale, device='cpu', dtype=torch.float).share_memory_()
+            self.dino_feats_valid = torch.zeros(buffer, dtype=torch.bool, device='cpu').share_memory_()
             self.uncertainties_inv = torch.ones(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
         else:
             self.dino_feats = None
             self.dino_feats_resize = None
+            self.dino_feats_valid = None
+
+        self.external_beta = torch.zeros(buffer, ht // self.down_scale, wd // self.down_scale, device='cpu', dtype=torch.float).share_memory_()
+        self.external_beta_valid = torch.zeros(buffer, dtype=torch.bool, device='cpu').share_memory_()
+
+    def set_beta_client(self, beta_client) -> None:
+        self.beta_client = beta_client
+
+    def _frame_id_to_index(self, frame_id: int) -> Optional[int]:
+        if frame_id is None:
+            return None
+        frame_id = int(frame_id)
+        with self.get_lock():
+            if self.counter.value == 0:
+                return None
+            matches = torch.where(self.frame_ids[: self.counter.value] == frame_id)[0]
+            if matches.numel() == 0:
+                return None
+            return int(matches[0].item())
+
+    def _copy_external_beta_if_available(
+        self, index: int, frame_id: Optional[int] = None
+    ) -> Optional[torch.Tensor]:
+        if frame_id is not None:
+            resolved = self._frame_id_to_index(frame_id)
+            if resolved is not None:
+                index = resolved
+        with self.get_lock():
+            if index < 0 or index >= self.counter.value:
+                return None
+            if not bool(self.external_beta_valid[index].item()):
+                return None
+            return self.external_beta[index].clone()
+
+    def _copy_dino_feature_if_available(
+        self, index: int, frame_id: Optional[int] = None, resized: bool = True
+    ) -> Optional[torch.Tensor]:
+        if self.dino_feats is None or self.dino_feats_valid is None:
+            return None
+        if frame_id is not None:
+            resolved = self._frame_id_to_index(frame_id)
+            if resolved is not None:
+                index = resolved
+        with self.get_lock():
+            if index < 0 or index >= self.counter.value:
+                return None
+            if not bool(self.dino_feats_valid[index].item()):
+                return None
+            if resized:
+                return self.dino_feats_resize[index].clone()
+            return self.dino_feats[index].clone()
+
+    def wait_for_external_beta(
+        self,
+        index: int,
+        frame_id: Optional[int] = None,
+        timeout_s: float = 30.0,
+        poll_interval_s: float = 0.01,
+    ) -> torch.Tensor:
+        deadline = time.time() + float(timeout_s)
+        while True:
+            beta = self._copy_external_beta_if_available(index, frame_id=frame_id)
+            if beta is not None:
+                return beta.to(self.device)
+            if time.time() > deadline:
+                ident = f"index={index}"
+                if frame_id is not None:
+                    ident += f", frame_id={frame_id}"
+                raise RuntimeError(f"Missing DINOv3 beta for {ident}")
+            time.sleep(poll_interval_s)
+
+    def wait_for_dino_feature(
+        self,
+        index: int,
+        frame_id: Optional[int] = None,
+        resized: bool = True,
+        timeout_s: float = 30.0,
+        poll_interval_s: float = 0.01,
+    ) -> torch.Tensor:
+        if self.dino_feats is None or self.dino_feats_valid is None:
+            raise RuntimeError("DINO feature buffers are not enabled")
+        deadline = time.time() + float(timeout_s)
+        while True:
+            feat = self._copy_dino_feature_if_available(
+                index, frame_id=frame_id, resized=resized
+            )
+            if feat is not None:
+                return feat.to(self.device)
+            if time.time() > deadline:
+                ident = f"index={index}"
+                if frame_id is not None:
+                    ident += f", frame_id={frame_id}"
+                raise RuntimeError(f"Missing DINOv3 feature for {ident}")
+            time.sleep(poll_interval_s)
+
+    def _ready_beta_indices(self, idxs) -> list[int]:
+        if isinstance(idxs, slice):
+            start = 0 if idxs.start is None else int(idxs.start)
+            stop = self.counter.value if idxs.stop is None else int(idxs.stop)
+            step = 1 if idxs.step is None else int(idxs.step)
+            idx_list = list(range(start, stop, step))
+        elif torch.is_tensor(idxs):
+            idx_list = [int(x) for x in idxs.detach().cpu().flatten().tolist()]
+        elif isinstance(idxs, int):
+            idx_list = [int(idxs)]
+        else:
+            idx_list = [int(x) for x in idxs]
+
+        return [idx for idx in idx_list if bool(self.external_beta_valid[idx].item())]
+
+    def _beta_for_index(self, index: int) -> Optional[torch.Tensor]:
+        if bool(self.external_beta_valid[index].item()):
+            return self.external_beta[index].clone().to(self.device)
+
+        frame_id = int(self.frame_ids[index].item())
+        try:
+            return self.interpolate_external_beta(frame_id)
+        except RuntimeError:
+            return None
+
+    def _uncertainty_from_beta_batch(
+        self, beta_batch: torch.Tensor, train_frac: float
+    ) -> torch.Tensor:
+        h = self.images.shape[2]
+        w = self.images.shape[3]
+        data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
+
+        beta_batch = torch.clip(beta_batch, min=0.1) + 1e-3
+        beta_full = F.interpolate(
+            beta_batch.unsqueeze(1),
+            size=(h, w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1)
+        return (beta_full - 0.1) * data_rate + 0.1
+
+    def interpolate_external_beta(self, frame_id: int) -> torch.Tensor:
+        frame_id = int(frame_id)
+        with self.get_lock():
+            count = int(self.counter.value)
+            if count == 0:
+                raise RuntimeError("Cannot interpolate beta without any keyframes")
+            frame_ids = self.frame_ids[:count].detach().cpu().tolist()
+            valid_mask = self.external_beta_valid[:count].detach().cpu().tolist()
+
+        valid_indices = [i for i, valid in enumerate(valid_mask) if valid]
+        if not valid_indices:
+            raise RuntimeError("Cannot interpolate beta because no keyframe beta is available")
+
+        position = bisect_left(frame_ids, frame_id)
+        left_idx = None
+        for i in range(position - 1, -1, -1):
+            if valid_mask[i]:
+                left_idx = i
+                break
+        right_idx = None
+        for i in range(position, count):
+            if valid_mask[i]:
+                right_idx = i
+                break
+
+        if left_idx is None and right_idx is None:
+            raise RuntimeError(f"Cannot interpolate beta for frame_id={frame_id}")
+
+        if left_idx is None:
+            return self.wait_for_external_beta(right_idx, frame_id=int(frame_ids[right_idx]))
+        if right_idx is None:
+            return self.wait_for_external_beta(left_idx, frame_id=int(frame_ids[left_idx]))
+
+        left_frame = int(frame_ids[left_idx])
+        right_frame = int(frame_ids[right_idx])
+        if right_frame == left_frame:
+            return self.wait_for_external_beta(left_idx, frame_id=left_frame)
+
+        beta_left = self.wait_for_external_beta(left_idx, frame_id=left_frame)
+        beta_right = self.wait_for_external_beta(right_idx, frame_id=right_frame)
+        weight = float(frame_id - left_frame) / float(right_frame - left_frame)
+        weight = float(np.clip(weight, 0.0, 1.0))
+        return ((1.0 - weight) * beta_left + weight * beta_right).contiguous()
+
+    def _store_dino_feature(self, index: int, feature: torch.Tensor, frame_id: Optional[int] = None) -> None:
+        if feature is None:
+            return
+        if self.dino_feats is None or self.dino_feats_resize is None or self.dino_feats_valid is None:
+            raise RuntimeError("DINO feature buffers are not enabled")
+        if torch.is_tensor(feature):
+            feat = feature.detach().cpu().float()
+        else:
+            feat = torch.as_tensor(np.asarray(feature), dtype=torch.float32)
+        if feat.dim() == 4 and feat.shape[0] == 1:
+            feat = feat[0]
+        if feat.dim() != 3:
+            raise ValueError(f"Unsupported DINO feature shape: {feat.shape}")
+        feat_dim = self.dino_feats.shape[-1]
+        if feat.shape[-1] == feat_dim:
+            feat_hwc = feat.contiguous()
+            feat_chw = feat_hwc.permute(2, 0, 1).contiguous()
+        elif feat.shape[0] == feat_dim:
+            feat_chw = feat.contiguous()
+            feat_hwc = feat_chw.permute(1, 2, 0).contiguous()
+        else:
+            raise ValueError(
+                f"Feature channel mismatch: got {feat.shape}, expected channel {feat_dim}"
+            )
+
+        resized = F.interpolate(
+            feat_chw.unsqueeze(0),
+            self.disps_up.shape[-2:],
+            mode='bilinear',
+            align_corners=False,
+        )
+        self.dino_feats[index] = feat_hwc
+        self.dino_feats_resize[index] = resized.squeeze(0)[:, self.slice_h, self.slice_w].cpu()
+        self.dino_feats_valid[index] = True
+        if frame_id is None:
+            frame_id = int(self.frame_ids[index].item())
+        if frame_id >= 0:
+            np.save(
+                os.path.join(self.feature_output_dir, f"{int(frame_id):05d}.npy"),
+                feat_hwc.numpy(),
+            )
+
+    def set_external_dino_feature(self, index: int, feature: torch.Tensor, frame_id: Optional[int] = None) -> None:
+        if feature is None:
+            return
+        if frame_id is not None:
+            resolved = self._frame_id_to_index(frame_id)
+            if resolved is not None:
+                index = resolved
+            elif index >= self.counter.value or int(self.frame_ids[index].item()) != int(frame_id):
+                return
+        with self.get_lock():
+            if index < 0 or index >= self.external_beta.shape[0]:
+                return
+            self.external_beta_valid[index] = False
+        self._store_dino_feature(index, feature, frame_id=frame_id)
+
+    def set_external_beta(self, index: int, beta: torch.Tensor, frame_id: Optional[int] = None) -> None:
+        if beta is None:
+            return
+        if frame_id is not None:
+            resolved = self._frame_id_to_index(frame_id)
+            if resolved is not None:
+                index = resolved
+            elif index >= self.counter.value or int(self.frame_ids[index].item()) != int(frame_id):
+                return
+        beta_arr = decode_beta_payload(beta)
+        beta_tensor = torch.from_numpy(beta_arr).float()
+        if beta_tensor.dim() == 3 and beta_tensor.shape[0] == 1:
+            beta_tensor = beta_tensor[0]
+        if beta_tensor.shape != self.uncertainties_inv[index].shape:
+            beta_tensor = F.interpolate(
+                beta_tensor.unsqueeze(0).unsqueeze(0),
+                size=self.uncertainties_inv[index].shape,
+                mode='bilinear',
+                align_corners=False,
+                ).squeeze(0).squeeze(0)
+        with self.get_lock():
+            self.external_beta[index] = beta_tensor.cpu()
+            self.external_beta_valid[index] = True
+        if frame_id is None:
+            frame_id = int(self.frame_ids[index].item())
+        if frame_id >= 0:
+            np.save(
+                os.path.join(self.beta_output_dir, f"{int(frame_id):05d}.npy"),
+                beta_tensor.cpu().numpy(),
+            )
+
+    def get_external_beta(
+        self,
+        index: int,
+        frame_id: Optional[int] = None,
+    ) -> torch.Tensor:
+        beta = self._copy_external_beta_if_available(index, frame_id=frame_id)
+        if beta is None:
+            if frame_id is not None and self._frame_id_to_index(frame_id) is None:
+                raise RuntimeError(
+                    f"Missing DINOv3 beta for non-keyframe frame_id={int(frame_id)}; "
+                    "use interpolate_external_beta instead"
+                )
+            raise RuntimeError(
+                f"Missing DINOv3 beta for keyframe index={int(index)}"
+                + (f", frame_id={int(frame_id)}" if frame_id is not None else "")
+            )
+        return beta.to(self.device)
+
+    def poll_beta_client(self, max_items: int = 32) -> int:
+        if self.beta_client is None:
+            return 0
+        return self.beta_client.poll(max_items=max_items)
+
+    def _compute_uncertainty_full_res(self, idxs, train_frac: float) -> torch.Tensor:
+        h = self.images.shape[2]
+        w = self.images.shape[3]
+        data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
+
+        if isinstance(idxs, slice):
+            start = 0 if idxs.start is None else int(idxs.start)
+            stop = self.counter.value if idxs.stop is None else int(idxs.stop)
+            step = 1 if idxs.step is None else int(idxs.step)
+            idx_list = list(range(start, stop, step))
+        elif torch.is_tensor(idxs):
+            idx_list = [int(x) for x in idxs.detach().cpu().flatten().tolist()]
+        elif isinstance(idxs, int):
+            idx_list = [int(idxs)]
+        else:
+            idx_list = [int(x) for x in idxs]
+
+        if len(idx_list) == 0:
+            return torch.empty(0, h, w, device=self.device)
+
+        beta_batch = self.external_beta[idx_list].to(self.device)
+        beta_batch = torch.clip(beta_batch, min=0.1) + 1e-3
+        beta_full = F.interpolate(
+            beta_batch.unsqueeze(1),
+            size=(h, w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1)
+        beta_full = (beta_full - 0.1) * data_rate + 0.1
+        return beta_full
+
+    def has_dino_feature(self, index: int) -> bool:
+        if self.dino_feats_valid is None:
+            return False
+        return bool(self.dino_feats_valid[index].item())
+
+    def get_dino_feature(self, index: int, resized: bool = True, frame_id: Optional[int] = None) -> Optional[torch.Tensor]:
+        if frame_id is not None:
+            idx = self._frame_id_to_index(frame_id)
+            if idx is not None and self.dino_feats_valid is not None and self.dino_feats_valid[idx]:
+                if resized:
+                    return self.dino_feats_resize[idx].to(self.device)
+                return self.dino_feats[idx].to(self.device)
+        if self.dino_feats is None or self.dino_feats_valid is None:
+            return None
+        if not self.dino_feats_valid[index]:
+            return None
+        if resized:
+            return self.dino_feats_resize[index].to(self.device)
+        return self.dino_feats[index].to(self.device)
 
     def get_lock(self):
         return self.counter.get_lock()
 
     def __item_setter(self, index, item):
-        if isinstance(index, int) and index >= self.counter.value:
-            self.counter.value = index + 1
-        
-        elif isinstance(index, torch.Tensor) and index.max().item() > self.counter.value:
-            self.counter.value = index.max().item() + 1
+        if isinstance(index, slice):
+            start = 0 if index.start is None else int(index.start)
+            stop = self.counter.value if index.stop is None else int(index.stop)
+            step = 1 if index.step is None else int(index.step)
+            indices = list(range(start, stop, step))
+        elif isinstance(index, torch.Tensor):
+            indices = [int(x) for x in index.detach().cpu().flatten().tolist()]
+        elif isinstance(index, int):
+            indices = [int(index)]
+        else:
+            indices = [int(x) for x in index]
 
-        self.timestamp[index] = item[0]
-        self.images[index] = item[1].cpu()
+        def _as_list(value):
+            if value is None:
+                return [None] * len(indices)
+            if torch.is_tensor(value):
+                if value.dim() == 0:
+                    return [value] * len(indices)
+                if value.shape[0] == len(indices):
+                    return [value[i] for i in range(len(indices))]
+                return [value] * len(indices)
+            if isinstance(value, (list, tuple)):
+                if len(value) == len(indices):
+                    return list(value)
+                return [value] * len(indices)
+            return [value] * len(indices)
 
-        if item[2] is not None:
-            self.poses[index] = item[2]
+        items = [ _as_list(part) for part in item ]
 
-        if item[3] is not None:
-            self.disps[index] = item[3]
+        for local_i, idx in enumerate(indices):
+            if idx >= self.counter.value:
+                self.counter.value = idx + 1
 
+            # Clear stale external caches before reusing this slot.
+            if self.uncertainty_aware:
+                if self.dino_feats_valid is not None:
+                    self.dino_feats_valid[idx] = False
+                    self.dino_feats[idx].zero_()
+                    self.dino_feats_resize[idx].zero_()
+            self.external_beta_valid[idx] = False
+            self.external_beta[idx].zero_()
 
-        if item[4] is not None:
-            mono_depth = item[4][self.slice_h,self.slice_w]
-            self.mono_disps[index] = torch.where(mono_depth>0, 1.0/mono_depth, 0)
-            self.mono_disps_up[index] = torch.where(item[4]>0, 1.0/item[4], 0)
-            # self.disps[index] = torch.where(mono_depth>0, 1.0/mono_depth, 0)
+            timestamp = items[0][local_i]
+            image = items[1][local_i]
+            pose = items[2][local_i]
+            disp = items[3][local_i]
+            mono_depth = items[4][local_i]
+            intrinsic = items[5][local_i]
+            fmap = items[6][local_i] if len(items) > 6 else None
+            net = items[7][local_i] if len(items) > 7 else None
+            inp = items[8][local_i] if len(items) > 8 else None
+            dino_feature = items[9][local_i] if len(items) > 9 else None
 
-        if item[5] is not None:
-            self.intrinsics[index] = item[5]
+            self.timestamp[idx] = timestamp
+            self.frame_ids[idx] = int(timestamp.item()) if torch.is_tensor(timestamp) else int(timestamp)
+            self.images[idx] = image.cpu()
 
-        if len(item) > 6 and item[6] is not None:
-            self.fmaps[index] = item[6]
+            if pose is not None:
+                self.poses[idx] = pose
 
-        if len(item) > 7 and item[7] is not None:
-            self.nets[index] = item[7]
+            if disp is not None:
+                self.disps[idx] = disp
 
-        if len(item) > 8 and item[8] is not None:
-            self.inps[index] = item[8]
+            if mono_depth is not None:
+                mono_depth = mono_depth[self.slice_h, self.slice_w]
+                self.mono_disps[idx] = torch.where(mono_depth > 0, 1.0 / mono_depth, 0)
+                self.mono_disps_up[idx] = torch.where(items[4][local_i] > 0, 1.0 / items[4][local_i], 0)
 
-        if len(item) > 9 and item[9] is not None:
-            self.dino_feats[index] = item[9].cpu()
+            if intrinsic is not None:
+                self.intrinsics[idx] = intrinsic
 
-            if len(item[9].shape) == 3:
-                self.dino_feats_resize[index] = F.interpolate(item[9].permute(2,0,1).unsqueeze(0),
-                                                            self.disps_up.shape[-2:], 
-                                                            mode='bilinear').squeeze()[:,self.slice_h,self.slice_w].cpu()
-            else:
-                self.dino_feats_resize[index] = F.interpolate(item[9].permute(0,3,1,2),
-                                                            self.disps_up.shape[-2:], 
-                                                            mode='bilinear')[:,:,self.slice_h,self.slice_w].cpu()
+            if fmap is not None:
+                self.fmaps[idx] = fmap
+
+            if net is not None:
+                self.nets[idx] = net
+
+            if inp is not None:
+                self.inps[idx] = inp
+
+            if dino_feature is not None:
+                self._store_dino_feature(idx, dino_feature, frame_id=int(self.frame_ids[idx].item()))
 
     def __setitem__(self, index, item):
         with self.get_lock():
@@ -449,20 +845,25 @@ class DepthVideo:
         
         i = 0
         while i*20 < self.counter.value:
-            dino_feat_batch = self.dino_feats[i*20:min((i+1)*20,self.counter.value),:,:,:].to(self.device)
-            with Lock():
-                uncer = self.uncer_network(dino_feat_batch)
+            idxs = list(range(i * 20, min((i + 1) * 20, self.counter.value)))
+            ready_idxs = []
+            beta_batch = []
+            for idx in idxs:
+                beta = self._beta_for_index(idx)
+                if beta is None:
+                    continue
+                ready_idxs.append(idx)
+                beta_batch.append(beta)
+            if not ready_idxs:
+                i += 1
+                continue
             train_frac = self.cfg['mapping']['uncertainty_params']['train_frac_fix']
-
-            h = self.images.shape[2]
-            w = self.images.shape[3]
-            uncer = torch.clip(uncer, min=0.1) + 1e-3
-            uncer = uncer.unsqueeze(1)
-            uncer = F.interpolate(uncer, size=(h, w), mode="bilinear").squeeze(1).detach()
-            data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
-            uncer = uncer[:, self.slice_h, self.slice_w]
-            uncer = (uncer - 0.1) * data_rate + 0.1
-            self.uncertainties_inv[i*20:min((i+1)*20,self.counter.value),:,:] = torch.clamp(0.5/uncer**2, 0.0, 1.0)
+            uncer = self._uncertainty_from_beta_batch(
+                torch.stack(beta_batch, dim=0), train_frac
+            )
+            uncer = uncer[:, self.slice_h, self.slice_w].detach()
+            with self.get_lock():
+                self.uncertainties_inv[ready_idxs,:,:] = torch.clamp(0.5/uncer**2, 0.0, 1.0)
 
             i += 1
 
@@ -472,20 +873,38 @@ class DepthVideo:
             # we only estimate uncertainty when we activate the mode
             raise Exception('This function should not be called if uncertainty aware is not activated')
         
-        dino_feat_batch = self.dino_feats[idxs,:,:,:].to(self.device)
-        with Lock():
-            uncer = self.uncer_network(dino_feat_batch)
-        train_frac = self.cfg['mapping']['uncertainty_params']['train_frac_fix']
+        if isinstance(idxs, slice):
+            start = 0 if idxs.start is None else int(idxs.start)
+            stop = self.counter.value if idxs.stop is None else int(idxs.stop)
+            step = 1 if idxs.step is None else int(idxs.step)
+            idx_list = list(range(start, stop, step))
+        elif torch.is_tensor(idxs):
+            idx_list = [int(x) for x in idxs.detach().cpu().flatten().tolist()]
+        elif isinstance(idxs, int):
+            idx_list = [int(idxs)]
+        else:
+            idx_list = [int(x) for x in idxs]
 
-        h = self.images.shape[2]
-        w = self.images.shape[3]
-        uncer = torch.clip(uncer, min=0.1) + 1e-3
-        uncer = uncer.unsqueeze(1)
-        uncer = torch.nn.functional.interpolate(uncer, size=(h, w), mode="bilinear").squeeze(1).detach()
-        data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
-        uncer = uncer[:, self.slice_h, self.slice_w]
-        uncer = (uncer - 0.1) * data_rate + 0.1
-        self.uncertainties_inv[idxs,:,:] = torch.clamp(0.5/uncer**2, 0.0, 1.0)
+        ready_idxs = []
+        beta_batch = []
+        for idx in idx_list:
+            beta = self._beta_for_index(idx)
+            if beta is None:
+                continue
+            ready_idxs.append(idx)
+            beta_batch.append(beta)
+
+        if not ready_idxs:
+            return
+
+        idx_tensor = torch.as_tensor(ready_idxs, dtype=torch.long)
+        train_frac = self.cfg['mapping']['uncertainty_params']['train_frac_fix']
+        uncer = self._uncertainty_from_beta_batch(
+            torch.stack(beta_batch, dim=0), train_frac
+        )
+        uncer = uncer[:, self.slice_h, self.slice_w].detach()
+        with self.get_lock():
+            self.uncertainties_inv[idx_tensor,:,:] = torch.clamp(0.5/uncer**2, 0.0, 1.0)
 
     def set_dirty(self,index_start, index_end):
         self.dirty[index_start:index_end] = True

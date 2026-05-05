@@ -59,6 +59,12 @@ def load_img_feature(idx,path,suffix=''):
     
     return feat_tensor  
 
+def load_uncertainty_beta(idx, path, suffix=''):
+    beta_path = f"{path}/mono_priors/betas/{idx:05d}{suffix}.npy"
+    beta = np.load(beta_path)
+    beta_tensor = torch.from_numpy(beta)
+    return beta_tensor
+
 
 def get_dataset(cfg, device='cuda:0'):
     return dataset_dict[cfg['dataset']](cfg, device=device)

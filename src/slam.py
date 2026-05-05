@@ -16,9 +16,9 @@ from src.utils.datasets import BaseDataset
 from src.tracker import Tracker
 from src.mapper import Mapper
 from src.backend import Backend
-from src.utils.dyn_uncertainty.uncertainty_model import generate_uncertainty_mlp
 from src.utils.datasets import RGB_NoPose
 from thirdparty.gaussian_splatting.scene.gaussian_model import GaussianModel
+from src.utils.external_beta import ExternalDinoClient
 
 class SLAM:
     def __init__(self, cfg, stream: BaseDataset):
@@ -48,18 +48,13 @@ class SLAM:
         self.all_trigered = torch.zeros((1)).int()
         self.all_trigered.share_memory_()
 
-        if self.cfg["mapping"]["uncertainty_params"]["activate"]:
-            n_features = self.cfg["mapping"]["uncertainty_params"]["feature_dim"]
-            self.uncer_network = generate_uncertainty_mlp(n_features)
-            self.uncer_network.share_memory()
-        else:
-            self.uncer_network = None
-            if self.cfg["tracking"]["uncertainty_params"]["activate"]:
-                raise ValueError(
-                    "uncertainty estimation cannot be activated on tracking while not on mapping"
-                )
-
-        self.video = DepthVideo(cfg, self.printer, uncer_network=self.uncer_network)
+        self.beta_cfg = cfg.get("beta_service", {})
+        self.beta_client = None
+        self.video = DepthVideo(
+            cfg,
+            self.printer,
+            beta_client=None,
+        )
         self.ba = Backend(self.droid_net, self.video, self.cfg)
 
         # post processor - fill in poses for non-keyframes
@@ -74,6 +69,60 @@ class SLAM:
         self.tracker: Tracker = None
         self.mapper: Mapper = None
         self.stream = stream
+
+    def _start_beta_client(self):
+        if not self.beta_cfg.get("activate", False):
+            return
+        if self.beta_client is not None:
+            return
+
+        self.beta_client = ExternalDinoClient(
+            host=self.beta_cfg.get("host", "127.0.0.1"),
+            port=self.beta_cfg.get("port", 5555),
+            authkey=self.beta_cfg.get("authkey", "wildgs-beta"),
+            jpeg_quality=self.beta_cfg.get("jpeg_quality", 90),
+        )
+        self.beta_client.on_result = self._handle_beta_result
+        self.video.set_beta_client(self.beta_client)
+        self.beta_client.start()
+
+    def _shutdown_beta_client(self):
+        if self.beta_client is None:
+            return
+        self.beta_client.shutdown()
+        self.beta_client = None
+        self.video.set_beta_client(None)
+
+    def _handle_beta_result(self, result):
+        status = result.get("status", "ok")
+        frame_id = result.get("frame_id", None)
+        video_idx = result.get("video_idx", None)
+        if status != "ok":
+            self.printer.print(
+                f"DINOv3 beta service error for frame {frame_id}: {result.get('error', 'unknown')}",
+                FontColor.ERROR,
+            )
+            return
+        if frame_id is None or video_idx is None:
+            self.printer.print(
+                "DINOv3 beta result missing frame_id or video_idx",
+                FontColor.ERROR,
+            )
+            return
+        beta = result.get("beta", None)
+        features = result.get("features", None)
+        if features is not None:
+            self.video.set_external_dino_feature(
+                int(video_idx),
+                features,
+                frame_id=int(frame_id),
+            )
+        if beta is not None:
+            self.video.set_external_beta(
+                int(video_idx),
+                beta,
+                frame_id=int(frame_id),
+            )
 
     def load_pretrained(self, cfg):
         droid_pretrained = cfg["tracking"]["pretrained"]
@@ -94,6 +143,7 @@ class SLAM:
         )
 
     def tracking(self, pipe):
+        self._start_beta_client()
         self.tracker = Tracker(self, pipe)
         self.printer.print("Tracking Triggered!", FontColor.TRACKER)
         self.all_trigered += 1
@@ -105,14 +155,14 @@ class SLAM:
             pass
         self.printer.print("Tracking Starts!", FontColor.TRACKER)
         self.printer.pbar_ready()
-        self.tracker.run(self.stream)
+        try:
+            self.tracker.run(self.stream)
+        finally:
+            self._shutdown_beta_client()
         self.printer.print("Tracking Done!", FontColor.TRACKER)
 
     def mapping(self, pipe, q_main2vis, q_vis2main):
-        if self.cfg["mapping"]["uncertainty_params"]["activate"]:
-            self.mapper = Mapper(self, pipe, self.uncer_network, q_main2vis, q_vis2main)
-        else:
-            self.mapper = Mapper(self, pipe, None, q_main2vis, q_vis2main)
+        self.mapper = Mapper(self, pipe, q_main2vis, q_vis2main)
         self.printer.print("Mapping Triggered!", FontColor.MAPPER)
 
         self.all_trigered += 1
@@ -215,11 +265,8 @@ class SLAM:
 
         self.mapper.gaussians.save_ply(f"{self.save_dir}/final_gs.ply")
 
-        if self.cfg["mapping"]["uncertainty_params"]["activate"]:
-            torch.save(
-                self.mapper.uncer_network.state_dict(),
-                self.save_dir + "/uncertainty_mlp_weight.pth",
-            )
+        if self.beta_client is not None:
+            self.beta_client.shutdown()
 
         self.printer.print("Metrics Evaluation Done!", FontColor.EVAL)
 

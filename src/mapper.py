@@ -9,7 +9,6 @@ from typing import Optional, Tuple, Union
 
 import cv2
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from munch import munchify
 from colorama import Fore, Style
@@ -31,7 +30,7 @@ from thirdparty.gaussian_splatting.utils.graphics_utils import (
     getWorld2View2,
 )
 from src.depth_video import DepthVideo
-from src.utils.datasets import get_dataset, load_metric_depth, load_img_feature
+from src.utils.datasets import get_dataset, load_metric_depth
 from src.utils.common import as_intrinsics_matrix, setup_seed
 from src.utils.Printer import Printer, FontColor
 from src.utils.pose_utils import update_pose
@@ -53,7 +52,7 @@ class Mapper(object):
     """
 
     def __init__(
-        self, slam, pipe: Connection, uncer_network: Optional[nn.Module] = None, 
+        self, slam, pipe: Connection,
         q_main2vis: Optional[mp.Queue] = None, q_vis2main: Optional[mp.Queue] = None
     ):
         # setup seed
@@ -66,6 +65,9 @@ class Mapper(object):
         self.verbose = slam.verbose
         self.device = torch.device(self.config["device"])
         self.video: DepthVideo = slam.video
+        self.beta_wait_timeout_s = self.config.get("beta_service", {}).get(
+            "timeout_s", 30.0
+        )
 
         # Set gaussian model
         self.model_params = munchify(self.config["mapping"]["model_params"])
@@ -125,13 +127,6 @@ class Mapper(object):
         self.uncer_params = munchify(self.config["mapping"]["uncertainty_params"])
         self.uncertainty_aware = self.uncer_params["activate"]
         if self.uncertainty_aware:
-            self.uncer_network = uncer_network
-            self.uncer_optimizer = torch.optim.Adam(
-                self.uncer_network.parameters(),
-                lr=self.uncer_params["lr"],
-                weight_decay=self.uncer_params["weight_decay"],
-            )
-
             self.vis_uncertainty_online = self.uncer_params["vis_uncertainty_online"]
 
         # Setup queue object for gui communication
@@ -240,24 +235,22 @@ class Mapper(object):
                 )
             self.keyframe_optimizers = torch.optim.Adam(opt_params)
 
-            with Lock():
-                if self.config['fast_mode']:
-                    # We are in fast mode,
-                    # update map and uncertainty MLP every 4 key frames
-                    if video_idx % 4 == 0:
-                        gaussian_split = self.map_opt_online(
-                            self.current_window, iters=self.mapping_itr_num
-                        )
-                    else:
-                        self._update_occ_aware_visibility(self.current_window)
-                else:
+            if self.config['fast_mode']:
+                # We are in fast mode, update map every 4 key frames.
+                if video_idx % 4 == 0:
                     gaussian_split = self.map_opt_online(
                         self.current_window, iters=self.mapping_itr_num
                     )
+                else:
+                    self._update_occ_aware_visibility(self.current_window)
+            else:
+                gaussian_split = self.map_opt_online(
+                    self.current_window, iters=self.mapping_itr_num
+                )
 
-                if gaussian_split:
-                    # do one more iteration after densify and prune
-                    self.map_opt_online(self.current_window, iters=1)
+            if gaussian_split:
+                # do one more iteration after densify and prune
+                self.map_opt_online(self.current_window, iters=1)
             torch.cuda.empty_cache()
 
             if self.config['gui']:
@@ -316,19 +309,25 @@ class Mapper(object):
                 .to(self.device)
                 .squeeze()
             )
-            load_feature_suffix = "full"
         else:
             color = self.frame_reader.get_color(frame_idx).to(self.device).squeeze()
-            load_feature_suffix = ""
 
         # Load metric depth
         metric_depth = load_metric_depth(frame_idx, self.save_dir).to(self.device)
 
-        # Load features if uncertainty-aware
+        # Load DINOv3 features and beta from shared memory if uncertainty-aware
         if self.uncertainty_aware:
-            features = load_img_feature(
-                frame_idx, self.save_dir, suffix=load_feature_suffix
-            ).to(self.device)
+            features = self.video.wait_for_dino_feature(
+                video_idx,
+                frame_id=frame_idx,
+                resized=False,
+                timeout_s=self.beta_wait_timeout_s,
+            )
+            _ = self.video.wait_for_external_beta(
+                video_idx,
+                frame_id=frame_idx,
+                timeout_s=self.beta_wait_timeout_s,
+            )
         else:
             features = None
 
@@ -836,7 +835,15 @@ class Mapper(object):
         # Using uncertainty only when uncertainty-aware tracking is activated
         if self.video.uncertainty_aware:
             with torch.no_grad():
-                uncer = self.uncer_network(features.to(color.device))
+                keyframe_idx = self.video._frame_id_to_index(frame_idx)
+                if keyframe_idx is not None:
+                    uncer = self.video.wait_for_external_beta(
+                        keyframe_idx,
+                        frame_id=frame_idx,
+                        timeout_s=self.beta_wait_timeout_s,
+                    )
+                else:
+                    uncer = self.video.interpolate_external_beta(frame_idx)
                 uncer = torch.clip(uncer, min=0.1) + 1e-3
                 uncer_resized = F.interpolate(
                     uncer.unsqueeze(0).unsqueeze(0),
@@ -934,6 +941,7 @@ class Mapper(object):
             cam_idx = np.random.choice(range(len(viewpoint_stack)))
             viewpoint = viewpoint_stack[cam_idx]
             kf_idx = viewpoint_id_stack[cam_idx]
+            frame_idx = int(self.video.timestamp[kf_idx].item())
 
             render_pkg = render(
                 viewpoint, self.gaussians, self.pipeline_params, self.background
@@ -977,15 +985,26 @@ class Mapper(object):
                     depth,
                     viewpoint,
                     opacity,
-                    self.uncer_network,
                     train_frac,
                     ssim_frac,
                     initialization=True,
+                    uncertainty_override=self.video.wait_for_external_beta(
+                        kf_idx,
+                        frame_id=frame_idx,
+                        timeout_s=self.beta_wait_timeout_s,
+                    ),
                 )
 
                 stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
+                feature = viewpoint.features.to(device=image.device)
+                current_uncertainty = F.interpolate(
+                    current_uncertainty.unsqueeze(0).unsqueeze(0),
+                    size=feature.shape[:2],
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0).squeeze(0)
                 feature_buffer = [
-                    viewpoint.features[::stride, ::stride].to(device=image.device),
+                    feature[::stride, ::stride],
                 ]
                 uncer_buffer = [
                     current_uncertainty[::stride, ::stride].unsqueeze(-1),
@@ -1028,9 +1047,6 @@ class Mapper(object):
                 self.gaussians.update_learning_rate(self.iteration_count)
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
-                if self.uncertainty_aware:
-                    self.uncer_optimizer.step()
-                    self.uncer_optimizer.zero_grad()
 
                 self.frame_count_log[kf_idx] += 1
 
@@ -1130,37 +1146,48 @@ class Mapper(object):
                     depth,
                     viewpoint,
                     opacity,
-                    self.uncer_network,
                     train_frac,
                     ssim_frac,
                     freeze_uncertainty_loss=self.iterations_after_densify_or_reset < 20,
+                    uncertainty_override=self.video.wait_for_external_beta(
+                        viewpoint.uid,
+                        frame_id=viewpoint.uid,
+                        timeout_s=self.beta_wait_timeout_s,
+                    ),
                 )
                 loss_mapping += current_loss_mapping
+                current_uncertainty = current_uncertainty.detach()
 
                 # Dino_regularization loss
                 if self.iterations_after_densify_or_reset >= 20:
                     stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
                     reg_multi = self.config["mapping"]["uncertainty_params"]["reg_mult"]
-
-                    viewpoint = viewpoint_stack[cam_idx]
-                    feature_buffer = [
-                        viewpoint_stack[reg_cam_idx].features.to(device=image.device)
+                    reg_viewpoints = [
+                        viewpoint_stack[reg_cam_idx]
                         for reg_cam_idx in range(
                             max(0, cam_idx - 2), min(len(viewpoint_stack), cam_idx + 3)
                         )
                     ]
-                    feat_dim = feature_buffer[0].shape[-1]
-                    feature_buffer = torch.stack(feature_buffer).view(-1, feat_dim)
-                    num_samples = feature_buffer.shape[0] // (stride ** 4)
-                    sampled_feature = feature_buffer[
-                        torch.randperm(feature_buffer.shape[0])[:num_samples]
-                    ].unsqueeze(0)
-                    sampled_uncer = self.uncer_network(sampled_feature)
-                    loss_mapping += (
-                        reg_multi
-                        * map_utils.compute_dino_regularization_loss(
-                            sampled_uncer, sampled_feature
+                    feature_buffer = []
+                    uncer_buffer = []
+                    for reg_view in reg_viewpoints:
+                        reg_feature = reg_view.features.to(device=image.device)
+                        reg_feature_sample = reg_feature[::stride, ::stride]
+                        reg_beta = self.video.wait_for_external_beta(
+                            reg_view.uid,
+                            frame_id=reg_view.uid,
+                            timeout_s=self.beta_wait_timeout_s,
                         )
+                        reg_beta = F.interpolate(
+                            reg_beta.unsqueeze(0).unsqueeze(0),
+                            size=reg_feature.shape[:2],
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze(0).squeeze(0)
+                        feature_buffer.append(reg_feature_sample)
+                        uncer_buffer.append(reg_beta[::stride, ::stride].unsqueeze(-1))
+                    loss_mapping += reg_multi * map_utils.compute_dino_regularization_loss(
+                        uncer_buffer, feature_buffer
                     )
 
             scaling = self.gaussians.get_scaling
@@ -1214,9 +1241,6 @@ class Mapper(object):
                 self.gaussians.update_learning_rate(self.iteration_count)
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
-                if self.uncertainty_aware:
-                    self.uncer_optimizer.step()
-                    self.uncer_optimizer.zero_grad()
 
             self.frame_count_log[viewpoint_kf_idx_stack[cam_idx]] += 1
 
@@ -1301,42 +1325,64 @@ class Mapper(object):
                     depth,
                     viewpoint,
                     opacity,
-                    self.uncer_network,
                     train_frac,
                     ssim_frac,
                     freeze_uncertainty_loss=self.iterations_after_densify_or_reset
                     < 200,
+                    uncertainty_override=self.video.wait_for_external_beta(
+                        viewpoint.uid,
+                        frame_id=viewpoint.uid,
+                        timeout_s=self.beta_wait_timeout_s,
+                    ),
                 )
                 loss_mapping += loss_mapping_this_frame
+                current_uncertainty = current_uncertainty.detach()
 
                 stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
+                current_feature = viewpoint.features.to(device=image.device)
+                current_uncertainty = F.interpolate(
+                    current_uncertainty.unsqueeze(0).unsqueeze(0),
+                    size=current_feature.shape[:2],
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0).squeeze(0)
                 uncer_buffer.append(
                     current_uncertainty[::stride, ::stride].unsqueeze(-1)
                 )
                 feature_buffer.append(
-                    viewpoint.features[::stride, ::stride].to(device=image.device)
+                    current_feature[::stride, ::stride]
                 )
 
             if self.uncertainty_aware and self.iterations_after_densify_or_reset >= 200:
                 stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
                 reg_multi = self.config["mapping"]["uncertainty_params"]["reg_mult"]
-                viewpoint = random_viewpoint_stack[rand_idx]
-                feature_buffer = [
-                    random_viewpoint_stack[reg_cam_idx].features.to(device=image.device)
+                reg_viewpoints = [
+                    random_viewpoint_stack[reg_cam_idx]
                     for reg_cam_idx in range(
                         max(0, rand_idx - 2),
                         min(len(random_viewpoint_stack), rand_idx + 3),
                     )
                 ]
-                feat_dim = feature_buffer[0].shape[-1]
-                feature_buffer = torch.stack(feature_buffer).view(-1, feat_dim)
-                num_samples = feature_buffer.shape[0] // (stride ** 4)
-                sampled_feature = feature_buffer[
-                    torch.randperm(feature_buffer.shape[0])[:num_samples]
-                ].unsqueeze(0)
-                sampled_uncer = self.uncer_network(sampled_feature)
+                feature_buffer = []
+                uncer_buffer = []
+                for reg_view in reg_viewpoints:
+                    reg_feature = reg_view.features.to(device=image.device)
+                    reg_feature_sample = reg_feature[::stride, ::stride]
+                    reg_beta = self.video.wait_for_external_beta(
+                        reg_view.uid,
+                        frame_id=reg_view.uid,
+                        timeout_s=self.beta_wait_timeout_s,
+                    )
+                    reg_beta = F.interpolate(
+                        reg_beta.unsqueeze(0).unsqueeze(0),
+                        size=reg_feature.shape[:2],
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0).squeeze(0)
+                    feature_buffer.append(reg_feature_sample)
+                    uncer_buffer.append(reg_beta[::stride, ::stride].unsqueeze(-1))
                 loss_mapping += reg_multi * map_utils.compute_dino_regularization_loss(
-                    sampled_uncer, sampled_feature
+                    uncer_buffer, feature_buffer
                 )
 
             viewspace_point_tensor_acm.append(viewspace_point_tensor)
@@ -1356,9 +1402,6 @@ class Mapper(object):
                 # Optimize the exposure compensation
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
-                if self.uncertainty_aware:
-                    self.uncer_optimizer.step()
-                    self.uncer_optimizer.zero_grad()
 
             for kf_idx in random_viewpoint_kf_idxs:
                 self.frame_count_log[kf_idx] += 1
@@ -1429,9 +1472,12 @@ class Mapper(object):
         """
         Compute the uncertainty for a given viewpoint without gradient computation.
         """
-        features = viewpoint.features.to(self.device)
-        with Lock():
-            uncertainty = self.uncer_network(features)
+        frame_id = int(self.video.timestamp[viewpoint.uid].item())
+        uncertainty = self.video.wait_for_external_beta(
+            viewpoint.uid,
+            frame_id=frame_id,
+            timeout_s=self.beta_wait_timeout_s,
+        )
 
         # Process uncertainty values
         uncertainty = torch.clip(uncertainty, min=0.1) + 1e-3
