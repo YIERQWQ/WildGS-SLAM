@@ -1,7 +1,10 @@
 #!/bin/bash
 
-mkdir -p datasets/Wild_SLAM_Mocap/scene1
-cd datasets/Wild_SLAM_Mocap/scene1
+set -e
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+mkdir -p "${ROOT_DIR}/datasets/Wild_SLAM_Mocap/scene1"
+cd "${ROOT_DIR}/datasets/Wild_SLAM_Mocap/scene1"
 
 scenes=(
     "crowd"

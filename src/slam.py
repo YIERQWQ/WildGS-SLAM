@@ -18,7 +18,6 @@ from src.mapper import Mapper
 from src.backend import Backend
 from src.utils.dyn_uncertainty.uncertainty_model import generate_uncertainty_mlp
 from src.utils.datasets import RGB_NoPose
-from src.gui import gui_utils, slam_gui
 from thirdparty.gaussian_splatting.scene.gaussian_model import GaussianModel
 
 class SLAM:
@@ -270,6 +269,9 @@ class SLAM:
         self.printer.print(f"File saved as {file_path}", FontColor.EVAL)
 
     def run(self):
+        if self.cfg['gui']:
+            from src.gui import gui_utils, slam_gui
+
         m_pipe, t_pipe = mp.Pipe()
 
         q_main2vis = mp.Queue() if self.cfg['gui'] else None
