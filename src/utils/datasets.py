@@ -344,11 +344,41 @@ class TUM_RGBD(BaseDataset):
         elif os.path.isfile(os.path.join(datapath, 'pose.txt')):
             pose_list = os.path.join(datapath, 'pose.txt')
 
-        image_list = os.path.join(datapath, 'rgb.txt')
         depth_list = os.path.join(datapath, 'depth.txt')
-
-        image_data = self.parse_list(image_list)
         depth_data = self.parse_list(depth_list)
+        image_list = os.path.join(datapath, 'rgb.txt')
+        if os.path.isfile(image_list):
+            image_data = self.parse_list(image_list)
+        else:
+            rgb_dir = os.path.join(datapath, 'rgb')
+            if not os.path.isdir(rgb_dir):
+                raise FileNotFoundError(
+                    f"Neither {image_list} nor {rgb_dir} exists."
+                )
+
+            def _rgb_sort_key(path):
+                stem = os.path.splitext(os.path.basename(path))[0]
+                try:
+                    return int(stem.split('_')[-1])
+                except ValueError:
+                    return stem
+
+            rgb_paths = sorted(
+                glob.glob(os.path.join(rgb_dir, '*.png')),
+                key=_rgb_sort_key,
+            )
+            if len(rgb_paths) == 0:
+                raise FileNotFoundError(f"No RGB frames found in {rgb_dir}")
+
+            if len(rgb_paths) != len(depth_data):
+                n = min(len(rgb_paths), len(depth_data))
+                rgb_paths = rgb_paths[:n]
+                depth_data = depth_data[:n]
+
+            image_data = np.empty((len(rgb_paths), 2), dtype=object)
+            image_data[:, 0] = depth_data[:, 0]
+            image_data[:, 1] = [os.path.relpath(p, datapath) for p in rgb_paths]
+
         pose_data = self.parse_list(pose_list, skiprows=0)
         pose_vecs = pose_data[:, 1:].astype(np.float64)
 
