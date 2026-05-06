@@ -9,7 +9,7 @@ import src.geom.ba
 from torch.multiprocessing import Value
 from torch.multiprocessing import Lock
 import torch.nn.functional as F
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from src.modules.droid_net import cvx_upsample
 import src.geom.projective_ops as pops
@@ -106,6 +106,31 @@ class DepthVideo:
 
     def set_beta_client(self, beta_client) -> None:
         self.beta_client = beta_client
+
+    def export_keyframe_snapshot(self, index: int) -> Dict[str, Any]:
+        with self.get_lock():
+            if index < 0 or index >= self.counter.value:
+                raise IndexError(f"Keyframe index out of range: {index}")
+            dino_feature = None
+            if (
+                self.dino_feats is not None
+                and self.dino_feats_valid is not None
+                and bool(self.dino_feats_valid[index].item())
+            ):
+                dino_feature = self.dino_feats[index].detach().cpu().clone()
+            return {
+                "timestamp": self.timestamp[index].detach().cpu().clone(),
+                "frame_id": int(self.frame_ids[index].item()),
+                "image": self.images[index].detach().cpu().clone(),
+                "pose": self.poses[index].detach().cpu().clone(),
+                "disp": self.disps[index].detach().cpu().clone(),
+                "mono_depth": self.mono_disps_up[index].detach().cpu().clone(),
+                "intrinsic": self.intrinsics[index].detach().cpu().clone(),
+                "fmap": self.fmaps[index].detach().cpu().clone(),
+                "net": self.nets[index].detach().cpu().clone(),
+                "inp": self.inps[index].detach().cpu().clone(),
+                "dino_feature": dino_feature,
+            }
 
     def _frame_id_to_index(self, frame_id: int) -> Optional[int]:
         if frame_id is None:
@@ -264,17 +289,17 @@ class DepthVideo:
             raise RuntimeError(f"Cannot interpolate beta for frame_id={frame_id}")
 
         if left_idx is None:
-            return self.wait_for_external_beta(right_idx, frame_id=int(frame_ids[right_idx]))
+            return self.get_external_beta(right_idx, frame_id=int(frame_ids[right_idx]))
         if right_idx is None:
-            return self.wait_for_external_beta(left_idx, frame_id=int(frame_ids[left_idx]))
+            return self.get_external_beta(left_idx, frame_id=int(frame_ids[left_idx]))
 
         left_frame = int(frame_ids[left_idx])
         right_frame = int(frame_ids[right_idx])
         if right_frame == left_frame:
-            return self.wait_for_external_beta(left_idx, frame_id=left_frame)
+            return self.get_external_beta(left_idx, frame_id=left_frame)
 
-        beta_left = self.wait_for_external_beta(left_idx, frame_id=left_frame)
-        beta_right = self.wait_for_external_beta(right_idx, frame_id=right_frame)
+        beta_left = self.get_external_beta(left_idx, frame_id=left_frame)
+        beta_right = self.get_external_beta(right_idx, frame_id=right_frame)
         weight = float(frame_id - left_frame) / float(right_frame - left_frame)
         weight = float(np.clip(weight, 0.0, 1.0))
         return ((1.0 - weight) * beta_left + weight * beta_right).contiguous()
@@ -349,7 +374,7 @@ class DepthVideo:
         beta_tensor = torch.from_numpy(beta_arr).float()
         if beta_tensor.dim() == 3 and beta_tensor.shape[0] == 1:
             beta_tensor = beta_tensor[0]
-        if beta_tensor.shape != self.uncertainties_inv[index].shape:
+        if self.uncertainties_inv is not None and beta_tensor.shape != self.uncertainties_inv[index].shape:
             beta_tensor = F.interpolate(
                 beta_tensor.unsqueeze(0).unsqueeze(0),
                 size=self.uncertainties_inv[index].shape,
@@ -366,6 +391,8 @@ class DepthVideo:
                 os.path.join(self.beta_output_dir, f"{int(frame_id):05d}.npy"),
                 beta_tensor.cpu().numpy(),
             )
+        if self.uncertainties_inv is not None:
+            self.update_uncertainty_mask_given_index(index)
 
     def get_external_beta(
         self,
@@ -498,32 +525,42 @@ class DepthVideo:
             inp = items[8][local_i] if len(items) > 8 else None
             dino_feature = items[9][local_i] if len(items) > 9 else None
 
-            self.timestamp[idx] = timestamp
+            if torch.is_tensor(timestamp):
+                self.timestamp[idx] = timestamp.to(self.device)
+            else:
+                self.timestamp[idx] = torch.as_tensor(timestamp, device=self.device)
             self.frame_ids[idx] = int(timestamp.item()) if torch.is_tensor(timestamp) else int(timestamp)
             self.images[idx] = image.cpu()
 
             if pose is not None:
-                self.poses[idx] = pose
+                self.poses[idx] = pose.to(self.device)
 
             if disp is not None:
-                self.disps[idx] = disp
+                if torch.is_tensor(disp):
+                    self.disps[idx] = disp.to(self.device)
+                else:
+                    self.disps[idx] = torch.as_tensor(
+                        disp, device=self.device, dtype=self.disps.dtype
+                    )
 
             if mono_depth is not None:
+                mono_depth = mono_depth.to(self.device)
                 mono_depth = mono_depth[self.slice_h, self.slice_w]
                 self.mono_disps[idx] = torch.where(mono_depth > 0, 1.0 / mono_depth, 0)
-                self.mono_disps_up[idx] = torch.where(items[4][local_i] > 0, 1.0 / items[4][local_i], 0)
+                mono_depth_up = items[4][local_i].to(self.device)
+                self.mono_disps_up[idx] = torch.where(mono_depth_up > 0, 1.0 / mono_depth_up, 0)
 
             if intrinsic is not None:
-                self.intrinsics[idx] = intrinsic
+                self.intrinsics[idx] = intrinsic.to(self.device)
 
             if fmap is not None:
-                self.fmaps[idx] = fmap
+                self.fmaps[idx] = fmap.to(self.device)
 
             if net is not None:
-                self.nets[idx] = net
+                self.nets[idx] = net.to(self.device)
 
             if inp is not None:
-                self.inps[idx] = inp
+                self.inps[idx] = inp.to(self.device)
 
             if dino_feature is not None:
                 self._store_dino_feature(idx, dino_feature, frame_id=int(self.frame_ids[idx].item()))
@@ -558,8 +595,9 @@ class DepthVideo:
     ### geometric operations ###
 
     @staticmethod
-    def format_indicies(ii, jj):
+    def format_indicies(ii, jj, device=None):
         """ to device, long, {-1} """
+        device = "cuda" if device is None else device
 
         if not isinstance(ii, torch.Tensor):
             ii = torch.as_tensor(ii)
@@ -567,8 +605,8 @@ class DepthVideo:
         if not isinstance(jj, torch.Tensor):
             jj = torch.as_tensor(jj)
 
-        ii = ii.to(device="cuda", dtype=torch.long).reshape(-1)
-        jj = jj.to(device="cuda", dtype=torch.long).reshape(-1)
+        ii = ii.to(device=device, dtype=torch.long).reshape(-1)
+        jj = jj.to(device=device, dtype=torch.long).reshape(-1)
 
         return ii, jj
 
@@ -590,7 +628,7 @@ class DepthVideo:
 
     def reproject(self, ii, jj):
         """ project points from ii -> jj """
-        ii, jj = DepthVideo.format_indicies(ii, jj)
+        ii, jj = DepthVideo.format_indicies(ii, jj, device=self.device)
         Gs = lietorch.SE3(self.poses[None])
 
         coords, valid_mask = \
@@ -607,7 +645,7 @@ class DepthVideo:
             N = self.counter.value
             ii, jj = torch.meshgrid(torch.arange(N), torch.arange(N),indexing="ij")
         
-        ii, jj = DepthVideo.format_indicies(ii, jj)
+        ii, jj = DepthVideo.format_indicies(ii, jj, device=self.device)
 
         if bidirectional:
 

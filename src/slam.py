@@ -1,4 +1,6 @@
+import json
 import os
+import shutil
 import torch
 import numpy as np
 import time
@@ -24,10 +26,18 @@ class SLAM:
     def __init__(self, cfg, stream: BaseDataset):
         super(SLAM, self).__init__()
         self.cfg = cfg
-        self.device = cfg["device"]
+        self.tracking_device = cfg.get("tracking_device", cfg["device"])
+        self.mapping_device = cfg.get("mapping_device", self.tracking_device)
+        self.device = self.tracking_device
         self.verbose: bool = cfg["verbose"]
         self.logger = None
         self.save_dir = cfg["data"]["output"] + "/" + cfg["scene"]
+        self.run_log_dir = os.environ.get("RUN_LOG_DIR")
+        self.run_log_scene_dir = (
+            os.path.join(self.run_log_dir, cfg["scene"])
+            if self.run_log_dir
+            else None
+        )
 
         os.makedirs(self.save_dir, exist_ok=True)
 
@@ -50,6 +60,7 @@ class SLAM:
 
         self.beta_cfg = cfg.get("beta_service", {})
         self.beta_client = None
+        self.keyframe_queue = None
         self.video = DepthVideo(
             cfg,
             self.printer,
@@ -81,6 +92,8 @@ class SLAM:
             port=self.beta_cfg.get("port", 5555),
             authkey=self.beta_cfg.get("authkey", "wildgs-beta"),
             jpeg_quality=self.beta_cfg.get("jpeg_quality", 90),
+            max_request_queue=self.beta_cfg.get("max_request_queue", 4096),
+            max_result_queue=self.beta_cfg.get("max_result_queue", 1024),
         )
         self.beta_client.on_result = self._handle_beta_result
         self.video.set_beta_client(self.beta_client)
@@ -93,15 +106,83 @@ class SLAM:
         self.beta_client = None
         self.video.set_beta_client(None)
 
+    def _load_tracker_stats(self):
+        candidates = [os.path.join(self.save_dir, "tracker_metrics.json")]
+        if self.run_log_scene_dir is not None:
+            candidates.append(os.path.join(self.run_log_scene_dir, "tracker_metrics.json"))
+
+        for path in candidates:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as fp:
+                    return json.load(fp)
+        return None
+
+    def _write_text_artifact(self, rel_path: str, text: str) -> None:
+        targets = [os.path.join(self.save_dir, rel_path)]
+        if self.run_log_scene_dir is not None:
+            targets.append(os.path.join(self.run_log_scene_dir, rel_path))
+
+        for path in targets:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fp:
+                fp.write(text)
+
+    def _mirror_run_artifacts(self) -> None:
+        if self.run_log_scene_dir is None:
+            return
+
+        os.makedirs(self.run_log_scene_dir, exist_ok=True)
+        for rel_dir in ("traj", "plots_before_refine", "plots_after_refine"):
+            src = os.path.join(self.save_dir, rel_dir)
+            if os.path.isdir(src):
+                shutil.copytree(
+                    src,
+                    os.path.join(self.run_log_scene_dir, rel_dir),
+                    dirs_exist_ok=True,
+                )
+
+        for rel_file in ("tracker_metrics.json", "evaluation_summary.txt", "cfg.yaml"):
+            src = os.path.join(self.save_dir, rel_file)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(self.run_log_scene_dir, rel_file))
+
+    @staticmethod
+    def _format_eval_section(title: str, scale, rotation, translation, stats) -> str:
+        lines = [f"##########{title}##########"]
+        if scale is not None:
+            lines.append(f"scale: {scale}")
+        if rotation is not None:
+            lines.append(f"rotation:\n{rotation}")
+        if translation is not None:
+            lines.append(f"translation:{translation}")
+        if stats is not None:
+            lines.append(f"statistics:\n{stats}")
+        lines.append("#" * 34)
+        return "\n".join(lines)
+
     def _handle_beta_result(self, result):
         status = result.get("status", "ok")
         frame_id = result.get("frame_id", None)
         video_idx = result.get("video_idx", None)
+        kf_seq = result.get("kf_seq", None)
         if status != "ok":
             self.printer.print(
                 f"DINOv3 beta service error for frame {frame_id}: {result.get('error', 'unknown')}",
                 FontColor.ERROR,
             )
+            if self.keyframe_queue is not None and kf_seq is not None:
+                self.keyframe_queue.put(
+                    {
+                        "type": "beta_update",
+                        "kf_seq": int(kf_seq),
+                        "frame_id": int(frame_id) if frame_id is not None else None,
+                        "video_idx": int(video_idx) if video_idx is not None else None,
+                        "status": status,
+                        "error": result.get("error", "unknown"),
+                        "beta": None,
+                        "features": None,
+                    }
+                )
             return
         if frame_id is None or video_idx is None:
             self.printer.print(
@@ -123,6 +204,17 @@ class SLAM:
                 beta,
                 frame_id=int(frame_id),
             )
+        if self.keyframe_queue is not None and kf_seq is not None:
+            self.keyframe_queue.put(
+                {
+                    "type": "beta_update",
+                    "kf_seq": int(kf_seq),
+                    "frame_id": int(frame_id) if frame_id is not None else None,
+                    "video_idx": int(video_idx) if video_idx is not None else None,
+                    "beta": beta,
+                    "features": features,
+                }
+            )
 
     def load_pretrained(self, cfg):
         droid_pretrained = cfg["tracking"]["pretrained"]
@@ -142,9 +234,13 @@ class SLAM:
             f"Load droid pretrained checkpoint from {droid_pretrained}!", FontColor.INFO
         )
 
-    def tracking(self, pipe):
+    def tracking(self, keyframe_queue):
+        self.keyframe_queue = keyframe_queue
+        self.cfg["device"] = self.tracking_device
+        self.device = self.tracking_device
+        torch.cuda.set_device(self.device)
         self._start_beta_client()
-        self.tracker = Tracker(self, pipe)
+        self.tracker = Tracker(self, keyframe_queue)
         self.printer.print("Tracking Triggered!", FontColor.TRACKER)
         self.all_trigered += 1
 
@@ -161,8 +257,26 @@ class SLAM:
             self._shutdown_beta_client()
         self.printer.print("Tracking Done!", FontColor.TRACKER)
 
-    def mapping(self, pipe, q_main2vis, q_vis2main):
-        self.mapper = Mapper(self, pipe, q_main2vis, q_vis2main)
+    def mapping(self, packet_queue, q_main2vis, q_vis2main):
+        self.cfg["device"] = self.mapping_device
+        self.device = self.mapping_device
+        torch.cuda.set_device(self.device)
+        self.droid_net = self.droid_net.to(self.device).eval()
+        self.video = DepthVideo(
+            self.cfg,
+            self.printer,
+            beta_client=None,
+        )
+        self.ba = Backend(self.droid_net, self.video, self.cfg)
+        self.traj_filler = PoseTrajectoryFiller(
+            cfg=self.cfg,
+            net=self.droid_net,
+            video=self.video,
+            printer=self.printer,
+            device=self.device,
+        )
+        self.keyframe_queue = packet_queue
+        self.mapper = Mapper(self, packet_queue, q_main2vis, q_vis2main)
         self.printer.print("Mapping Triggered!", FontColor.MAPPER)
 
         self.all_trigered += 1
@@ -195,6 +309,8 @@ class SLAM:
 
     def terminate(self):
         """fill poses for non-keyframe images and evaluate"""
+        tracker_stats = self._load_tracker_stats()
+        summary_sections = []
 
         if (
             self.cfg["tracking"]["backend"]["final_ba"]
@@ -211,6 +327,15 @@ class SLAM:
                         self.logger,
                         self.printer,
                     )
+                    summary_sections.append(
+                        self._format_eval_section(
+                            "Keyframes traj (before final BA)",
+                            global_scale,
+                            r_a,
+                            t_a,
+                            ate_statistics,
+                        )
+                    )
                 except Exception as e:
                     self.printer.print(e, FontColor.ERROR)
 
@@ -223,6 +348,8 @@ class SLAM:
             self.backend()
 
         self.video.save_video(f"{self.save_dir}/video.npz")
+        kf_eval_stats = None
+        kf_scale = kf_rot = kf_trans = None
         if not isinstance(self.stream, RGB_NoPose):
             try:
                 ate_statistics, global_scale, r_a, t_a = kf_traj_eval(
@@ -232,6 +359,17 @@ class SLAM:
                     self.stream,
                     self.logger,
                     self.printer,
+                )
+                kf_eval_stats = ate_statistics
+                kf_scale, kf_rot, kf_trans = global_scale, r_a, t_a
+                summary_sections.append(
+                    self._format_eval_section(
+                        "Keyframes traj",
+                        global_scale,
+                        r_a,
+                        t_a,
+                        ate_statistics,
+                    )
                 )
             except Exception as e:
                 self.printer.print(e, FontColor.ERROR)
@@ -252,7 +390,7 @@ class SLAM:
 
         # Regenerate feature extractor for non-keyframes
         self.traj_filler.setup_feature_extractor()
-        full_traj_eval(
+        _, _, _, full_traj_output, full_scale, full_rot, full_trans, full_stats = full_traj_eval(
             self.traj_filler,
             self.mapper,
             f"{self.save_dir}/traj",
@@ -262,8 +400,47 @@ class SLAM:
             self.printer,
             self.cfg['fast_mode'],
         )
+        if full_traj_output is not None:
+            self.printer.print(full_traj_output, FontColor.EVAL)
+            self.printer.print("#"*29, FontColor.EVAL)
+            summary_sections.append(
+                self._format_eval_section(
+                    "Full traj",
+                    full_scale,
+                    full_rot,
+                    full_trans,
+                    full_stats,
+                )
+            )
 
         self.mapper.gaussians.save_ply(f"{self.save_dir}/final_gs.ply")
+
+        if tracker_stats is not None:
+            tracker_section = ["##########Frontend summary##########"]
+            for key in [
+                "frames_total",
+                "keyframes_total",
+                "keyframe_ratio",
+                "total_elapsed_s",
+                "frontend_fps",
+                "frontend_avg_ms",
+                "frontend_fps_steady",
+                "keyframe_avg_ms",
+                "non_keyframe_avg_ms",
+                "first_keyframe_latency_ms",
+            ]:
+                if key in tracker_stats:
+                    tracker_section.append(f"{key}: {tracker_stats[key]}")
+            tracker_section.append("#" * 34)
+            summary_sections.insert(0, "\n".join(tracker_section))
+
+        summary_text = "\n\n".join(summary_sections) if summary_sections else "No evaluation summary available."
+        self._write_text_artifact("evaluation_summary.txt", summary_text)
+        self.printer.print(
+            f"Saved evaluation summary to {self.save_dir}/evaluation_summary.txt",
+            FontColor.EVAL,
+        )
+        self._mirror_run_artifacts()
 
         if self.beta_client is not None:
             self.beta_client.shutdown()
@@ -319,14 +496,15 @@ class SLAM:
         if self.cfg['gui']:
             from src.gui import gui_utils, slam_gui
 
-        m_pipe, t_pipe = mp.Pipe()
+        keyframe_queue = mp.Queue()
+        self.keyframe_queue = keyframe_queue
 
         q_main2vis = mp.Queue() if self.cfg['gui'] else None
         q_vis2main = mp.Queue() if self.cfg['gui'] else None
 
         processes = [
-            mp.Process(target=self.tracking, args=(t_pipe,)),
-            mp.Process(target=self.mapping, args=(m_pipe,q_main2vis,q_vis2main)),
+            mp.Process(target=self.tracking, args=(keyframe_queue,)),
+            mp.Process(target=self.mapping, args=(keyframe_queue,q_main2vis,q_vis2main)),
         ]
         self.num_running_thread += len(processes)
         if self.cfg['gui']:

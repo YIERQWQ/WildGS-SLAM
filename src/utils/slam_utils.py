@@ -9,12 +9,13 @@ from src.utils.dyn_uncertainty import mapping_utils as map_utils
 
 def image_gradient(image):
     # Compute image gradient using Scharr Filter
+    device = image.device
     c = image.shape[0]
     conv_y = torch.tensor(
-        [[3, 0, -3], [10, 0, -10], [3, 0, -3]], dtype=torch.float32, device="cuda"
+        [[3, 0, -3], [10, 0, -10], [3, 0, -3]], dtype=torch.float32, device=device
     )
     conv_x = torch.tensor(
-        [[3, 10, 3], [0, 0, 0], [-3, -10, -3]], dtype=torch.float32, device="cuda"
+        [[3, 10, 3], [0, 0, 0], [-3, -10, -3]], dtype=torch.float32, device=device
     )
     normalizer = 1.0 / torch.abs(conv_y).sum()
     p_img = torch.nn.functional.pad(image, (1, 1, 1, 1), mode="reflect")[None]
@@ -29,9 +30,10 @@ def image_gradient(image):
 
 def image_gradient_mask(image, eps=0.01):
     # Compute image gradient mask
+    device = image.device
     c = image.shape[0]
-    conv_y = torch.ones((1, 1, 3, 3), dtype=torch.float32, device="cuda")
-    conv_x = torch.ones((1, 1, 3, 3), dtype=torch.float32, device="cuda")
+    conv_y = torch.ones((1, 1, 3, 3), dtype=torch.float32, device=device)
+    conv_x = torch.ones((1, 1, 3, 3), dtype=torch.float32, device=device)
     p_img = torch.nn.functional.pad(image, (1, 1, 1, 1), mode="reflect")[None]
     p_img = torch.abs(p_img) > eps
     img_grad_v = torch.nn.functional.conv2d(
@@ -66,7 +68,7 @@ def get_loss_tracking_rgb(config, image, opacity, viewpoint, uncertainty=None):
     Returns:
         Scalar loss tensor
     """
-    gt_image = viewpoint.original_image.cuda()
+    gt_image = viewpoint.original_image.to(image.device)
     _, h, w = gt_image.shape
     mask_shape = (1, h, w)
 
@@ -116,7 +118,7 @@ def get_loss_mapping(config, image, depth, viewpoint, initialization=False):
 def get_loss_mapping_rgbd(config, image, depth, viewpoint):
     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
-    gt_image = viewpoint.original_image.cuda()
+    gt_image = viewpoint.original_image.to(image.device)
     _, h, w = gt_image.shape
     mask_shape = (1, h, w)
 
@@ -185,7 +187,7 @@ def get_loss_mapping_uncertainty(
     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
     
     # Get reference data
-    gt_img = viewpoint.original_image.cuda()
+    gt_img = viewpoint.original_image.to(rendered_img.device)
     ref_depth = torch.from_numpy(viewpoint.depth).to(
         dtype=torch.float32, device=rendered_img.device
     )[None]

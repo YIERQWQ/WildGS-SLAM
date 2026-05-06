@@ -15,6 +15,7 @@ export DINOV3_WEIGHTS
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 RUN_LOG_DIR="${ROOT_DIR}/output/run_logs/${RUN_TS}"
 mkdir -p "${RUN_LOG_DIR}"
+export RUN_LOG_DIR
 RUN_LOG_FILE="${RUN_LOG_DIR}/run.log"
 exec > >(tee -a "${RUN_LOG_FILE}") 2>&1
 
@@ -51,7 +52,7 @@ if port_is_open "${BETA_HOST}" "${BETA_PORT}"; then
     BETA_PID=""
 else
     mkdir -p "$(dirname "${BETA_LOG}")"
-    CUDA_VISIBLE_DEVICES=1 python src/utils/dino_beta_service.py \
+    CUDA_VISIBLE_DEVICES=0 python src/utils/dino_beta_service.py \
         --device cuda:0 \
         --host "${BETA_HOST}" \
         --port "${BETA_PORT}" \
@@ -62,4 +63,4 @@ else
     wait_for_port "${BETA_HOST}" "${BETA_PORT}" 300
 fi
 
-CUDA_VISIBLE_DEVICES=0 python run.py ./configs/Dynamic/Wild_SLAM_Mocap/crowd_demo_headless.yaml
+CUDA_VISIBLE_DEVICES=0,1 python run.py ./configs/Dynamic/Wild_SLAM_Mocap/crowd_demo_headless.yaml

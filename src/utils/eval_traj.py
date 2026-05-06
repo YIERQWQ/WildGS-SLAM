@@ -173,7 +173,7 @@ def full_traj_eval(traj_filler, mapper, plot_parent_dir, plot_name, stream, logg
 
     if isinstance(stream, RGB_NoPose):
         # We don't have GT pose to evaluate
-        return traj_est_not_align, None, None
+        return traj_est_not_align, None, None, None, None, None, None, None
 
     r_a, t_a, s, traj_est, traj_ref = align_full_traj(traj_est, stream, printer)    
 
@@ -183,8 +183,6 @@ def full_traj_eval(traj_filler, mapper, plot_parent_dir, plot_name, stream, logg
     output_str += f"rotation:\n{r_a}\n"
     output_str += f"translation:{t_a}\n"
     output_str += f"statistics:\n{ape_statistics}"
-    printer.print(output_str,FontColor.EVAL)
-    printer.print("#"*29,FontColor.EVAL)
 
     
     out_path=f'{plot_parent_dir}/metrics_full_traj.txt'
@@ -192,7 +190,7 @@ def full_traj_eval(traj_filler, mapper, plot_parent_dir, plot_name, stream, logg
         fp.write(output_str)
     if logger is not None:
         logger.log({'full_ate_rmse':ape_statistics['rmse']})
-    return traj_est_not_align, traj_est, traj_ref
+    return traj_est_not_align, traj_est, traj_ref, output_str, s, r_a, t_a, ape_statistics
 
 def save_traj(traj_est,output_file):
     N = traj_est.shape[0]

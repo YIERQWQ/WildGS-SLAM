@@ -5,6 +5,8 @@ max_frames: -1       # use the first X images from the dataset, -1 means using a
 setup_seed: 43
 fast_mode: False
 device: "cuda:0"
+tracking_device: "cuda:0"
+mapping_device: "cuda:1"
 
 mapping:
   online_plotting: False # render and save images online

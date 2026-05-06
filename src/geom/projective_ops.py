@@ -116,7 +116,9 @@ def projective_transform(poses, depths, intrinsics, ii, jj, jacobian=False, retu
     # transform
     Gij = poses[:,jj] * poses[:,ii].inv()
 
-    Gij.data[:,ii==jj] = torch.as_tensor([-0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], device="cuda")
+    Gij.data[:,ii==jj] = torch.as_tensor(
+        [-0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], device=Gij.device
+    )
     X1, Ja = actp(Gij, X0, jacobian=jacobian)
     
     # project (pinhole)
@@ -150,4 +152,3 @@ def induced_flow(poses, disps, intrinsics, ii, jj):
     coords1, valid = projective_transform(poses, disps, intrinsics, ii, jj, False)
 
     return coords1[...,:2] - coords0, valid
-

@@ -151,6 +151,7 @@ class AsyncBetaClient:
         video_idx: int,
         image: torch.Tensor,
         intrinsics: torch.Tensor,
+        kf_seq: Optional[int] = None,
     ) -> bool:
         if self._thread is None:
             self.start()
@@ -169,6 +170,7 @@ class AsyncBetaClient:
             "cmd": "infer",
             "frame_id": int(frame_id),
             "video_idx": int(video_idx),
+            "kf_seq": None if kf_seq is None else int(kf_seq),
             "intrinsics": intrinsics_list,
             "image_size": [int(image_size[0]), int(image_size[1])],
             "rgb_jpeg": rgb_jpeg,
@@ -186,6 +188,7 @@ class AsyncBetaClient:
         video_idx: int,
         image: torch.Tensor,
         intrinsics: torch.Tensor,
+        kf_seq: Optional[int] = None,
         timeout_s: float = 120.0,
     ) -> Dict[str, Any]:
         rgb_jpeg, image_size = encode_rgb_jpeg(image, quality=self.jpeg_quality)
@@ -198,6 +201,7 @@ class AsyncBetaClient:
             "cmd": "infer",
             "frame_id": int(frame_id),
             "video_idx": int(video_idx),
+            "kf_seq": None if kf_seq is None else int(kf_seq),
             "intrinsics": intrinsics_list,
             "image_size": [int(image_size[0]), int(image_size[1])],
             "rgb_jpeg": rgb_jpeg,

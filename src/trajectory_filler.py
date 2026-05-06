@@ -83,10 +83,10 @@ class PoseTrajectoryFiller:
         if self.uncertainty_aware:
             self.video.update_uncertainty_mask_given_index(range(N,N+M))
 
-        graph = FactorGraph(self.video, self.update)
+        graph = FactorGraph(self.video, self.update, device=self.device)
         # build edge between current frame and nearby keyframes for optimization
-        graph.add_factors(t0.cuda(), torch.arange(N, N+M).cuda())
-        graph.add_factors(t1.cuda(), torch.arange(N, N+M).cuda())
+        graph.add_factors(t0.to(self.device), torch.arange(N, N + M, device=self.device))
+        graph.add_factors(t1.to(self.device), torch.arange(N, N + M, device=self.device))
 
         for _ in range(12):
             graph.update(N, N+M, motion_only=True)

@@ -119,6 +119,7 @@ def handle_request(
         "status": "ok",
         "frame_id": frame_id,
         "video_idx": video_idx,
+        "kf_seq": request.get("kf_seq"),
         "latency_ms": latency_ms,
         "beta": beta.detach().cpu().numpy(),
         "features": feat_map.squeeze(0).permute(1, 2, 0).detach().cpu().numpy(),
