@@ -96,7 +96,9 @@ def render(
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     shs = None
     colors_precomp = None
-    if colors_precomp is None:
+    if override_color is not None:
+        colors_precomp = override_color
+    elif colors_precomp is None:
         if pipe.convert_SHs_python:
             shs_view = pc.get_features.transpose(1, 2).view(
                 -1, 3, (pc.max_sh_degree + 1) ** 2
@@ -109,9 +111,6 @@ def render(
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
             shs = pc.get_features
-    else:
-        colors_precomp = override_color
-
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
     if mask is not None:
         rendered_image, radii, depth, opacity = rasterizer(

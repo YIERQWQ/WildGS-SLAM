@@ -27,6 +27,12 @@ class Frontend:
         self.frontend_thresh = cfg['tracking']['frontend']['thresh']
         self.frontend_radius = cfg['tracking']['frontend']['radius']
         self.frontend_max_factors = cfg['tracking']['frontend']['max_factors']
+        self.loop_ba_interval = max(
+            1, int(cfg['tracking']['frontend'].get('loop_ba_interval', 4))
+        )
+        self.clear_cuda_cache_in_frontend = bool(
+            cfg['tracking'].get('clear_cuda_cache_in_frontend', False)
+        )
 
         self.enable_loop = cfg['tracking']['frontend']['enable_loop']
         self.loop_closing = LoopClosing(net, video, cfg)
@@ -47,6 +53,16 @@ class Frontend:
         #  that have been updated more than cfg['tracking']['max_age']
         self.max_consecutive_drop_of_keyframes = (cfg['tracking']['max_age']/self.iters1)//3
         self.num_keyframes_dropped = 0
+        self.last_loop_ba_t = -self.loop_ba_interval
+        self.uncertainty_update_interval = max(
+            1,
+            int(
+                cfg["mapping"]["uncertainty_params"].get(
+                    "mask_update_interval", 4
+                )
+            ),
+        )
+        self._uncertainty_update_counter = 0
 
     def __update(self, force_to_add_keyframe):
         """ add edges, perform update """
@@ -76,10 +92,15 @@ class Frontend:
         else:
             cur_t = self.video.counter.value
             self.num_keyframes_dropped  = 0
-            if self.enable_loop and cur_t > self.frontend_window:
+            if (
+                self.enable_loop
+                and cur_t > self.frontend_window
+                and (cur_t - self.last_loop_ba_t) >= self.loop_ba_interval
+            ):
                 n_kf, n_edge = self.loop_closing.loop_ba(t_start=0, t_end=cur_t, steps=self.iters2, 
                                                          motion_only=False, local_graph=self.graph,
                                                          enable_wq=True)
+                self.last_loop_ba_t = cur_t
                 if n_edge == 0:
                     for itr in range(self.iters2):
                         self.graph.update(t0=None, t1=None, use_inactive=True)
@@ -94,7 +115,8 @@ class Frontend:
 
         # update visualization
         self.video.set_dirty(self.graph.ii.min(), self.t1)
-        torch.cuda.empty_cache()
+        if self.clear_cuda_cache_in_frontend:
+            torch.cuda.empty_cache()
 
     def __initialize(self):
         """ initialize the SLAM system, i.e. bootstrapping """
@@ -169,7 +191,9 @@ class Frontend:
         # do update
         elif self.is_initialized and self.t1 < self.video.counter.value:
             if self.cfg['tracking']["uncertainty_params"]['activate']:
-                self.video.update_all_uncertainty_mask()
+                self._uncertainty_update_counter += 1
+                if self._uncertainty_update_counter >= self.uncertainty_update_interval:
+                    self.video.update_all_uncertainty_mask()
+                    self._uncertainty_update_counter = 0
             self.__update(force_to_add_keyframe)
             self.video.update_valid_depth_mask()
-

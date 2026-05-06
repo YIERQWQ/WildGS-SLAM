@@ -21,7 +21,7 @@ from src.utils.external_beta import decode_beta_payload
 class DepthVideo:
     ''' store the estimated poses and depth maps, 
         shared between tracker and mapper '''
-    def __init__(self, cfg, printer, beta_client=None):
+    def __init__(self, cfg, printer, uncer_network=None, beta_client=None):
         self.cfg =cfg
         self.output = f"{cfg['data']['output']}/{cfg['scene']}"
         ht = cfg['cam']['H_out']
@@ -71,7 +71,10 @@ class DepthVideo:
         # initialize poses to identity transformation
         self.poses[:] = torch.as_tensor([0, 0, 0, 0, 0, 0, 1], dtype=torch.float, device=self.device)
         self.printer = printer
+        self.uncer_network = uncer_network
         self.beta_client = beta_client
+        self.uncer_checkpoint_path = os.path.join(self.output, "uncertainty_student.pth")
+        self._uncer_checkpoint_mtime = 0.0
         
         self.uncertainty_aware = (
             cfg['tracking']["uncertainty_params"]['activate']
@@ -107,6 +110,26 @@ class DepthVideo:
     def set_beta_client(self, beta_client) -> None:
         self.beta_client = beta_client
 
+    def set_uncer_network(self, uncer_network) -> None:
+        self.uncer_network = uncer_network
+
+    def _refresh_uncer_network_if_needed(self) -> None:
+        if self.uncer_network is None:
+            return
+        if not os.path.exists(self.uncer_checkpoint_path):
+            return
+        mtime = os.path.getmtime(self.uncer_checkpoint_path)
+        if mtime <= self._uncer_checkpoint_mtime:
+            return
+        state = torch.load(
+            self.uncer_checkpoint_path,
+            map_location=self.device,
+            weights_only=True,
+        )
+        if isinstance(state, dict):
+            self.uncer_network.load_state_dict(state)
+            self._uncer_checkpoint_mtime = mtime
+
     def export_keyframe_snapshot(self, index: int) -> Dict[str, Any]:
         with self.get_lock():
             if index < 0 or index >= self.counter.value:
@@ -117,18 +140,18 @@ class DepthVideo:
                 and self.dino_feats_valid is not None
                 and bool(self.dino_feats_valid[index].item())
             ):
-                dino_feature = self.dino_feats[index].detach().cpu().clone()
+                dino_feature = self.dino_feats[index].detach().cpu().numpy().copy()
             return {
-                "timestamp": self.timestamp[index].detach().cpu().clone(),
+                "timestamp": int(self.timestamp[index].item()),
                 "frame_id": int(self.frame_ids[index].item()),
-                "image": self.images[index].detach().cpu().clone(),
-                "pose": self.poses[index].detach().cpu().clone(),
-                "disp": self.disps[index].detach().cpu().clone(),
-                "mono_depth": self.mono_disps_up[index].detach().cpu().clone(),
-                "intrinsic": self.intrinsics[index].detach().cpu().clone(),
-                "fmap": self.fmaps[index].detach().cpu().clone(),
-                "net": self.nets[index].detach().cpu().clone(),
-                "inp": self.inps[index].detach().cpu().clone(),
+                "image": self.images[index].detach().cpu().numpy().copy(),
+                "pose": self.poses[index].detach().cpu().numpy().copy(),
+                "disp": self.disps[index].detach().cpu().numpy().copy(),
+                "mono_depth": self.mono_disps_up[index].detach().cpu().numpy().copy(),
+                "intrinsic": self.intrinsics[index].detach().cpu().numpy().copy(),
+                "fmap": self.fmaps[index].detach().cpu().numpy().copy(),
+                "net": self.nets[index].detach().cpu().numpy().copy(),
+                "inp": self.inps[index].detach().cpu().numpy().copy(),
                 "dino_feature": dino_feature,
             }
 
@@ -175,6 +198,20 @@ class DepthVideo:
             if resized:
                 return self.dino_feats_resize[index].clone()
             return self.dino_feats[index].clone()
+
+    @staticmethod
+    def _to_tensor(value, dtype=None, device=None):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            tensor = value.detach().clone()
+        else:
+            tensor = torch.as_tensor(value)
+        if dtype is not None:
+            tensor = tensor.to(dtype=dtype)
+        if device is not None:
+            tensor = tensor.to(device)
+        return tensor
 
     def wait_for_external_beta(
         self,
@@ -235,6 +272,14 @@ class DepthVideo:
         return [idx for idx in idx_list if bool(self.external_beta_valid[idx].item())]
 
     def _beta_for_index(self, index: int) -> Optional[torch.Tensor]:
+        self._refresh_uncer_network_if_needed()
+        if self.uncer_network is not None and self.has_dino_feature(index):
+            feature = self.get_dino_feature(index, resized=True)
+            if feature is not None:
+                with torch.no_grad():
+                    uncertainty, _ = self.uncer_network(feature.unsqueeze(0).to(self.device))
+                return uncertainty.squeeze(0).detach()
+
         if bool(self.external_beta_valid[index].item()):
             return self.external_beta[index].clone().to(self.device)
 
@@ -399,6 +444,10 @@ class DepthVideo:
         index: int,
         frame_id: Optional[int] = None,
     ) -> torch.Tensor:
+        beta = self._beta_for_index(index)
+        if beta is not None:
+            return beta.to(self.device)
+
         beta = self._copy_external_beta_if_available(index, frame_id=frame_id)
         if beta is None:
             if frame_id is not None and self._frame_id_to_index(frame_id) is None:
@@ -487,6 +536,10 @@ class DepthVideo:
         def _as_list(value):
             if value is None:
                 return [None] * len(indices)
+            if isinstance(value, np.ndarray):
+                if value.ndim > 0 and value.shape[0] == len(indices):
+                    return [value[i] for i in range(len(indices))]
+                return [value] * len(indices)
             if torch.is_tensor(value):
                 if value.dim() == 0:
                     return [value] * len(indices)
@@ -525,42 +578,56 @@ class DepthVideo:
             inp = items[8][local_i] if len(items) > 8 else None
             dino_feature = items[9][local_i] if len(items) > 9 else None
 
-            if torch.is_tensor(timestamp):
-                self.timestamp[idx] = timestamp.to(self.device)
-            else:
-                self.timestamp[idx] = torch.as_tensor(timestamp, device=self.device)
-            self.frame_ids[idx] = int(timestamp.item()) if torch.is_tensor(timestamp) else int(timestamp)
-            self.images[idx] = image.cpu()
+            timestamp_tensor = self._to_tensor(
+                timestamp, dtype=self.timestamp.dtype, device=self.device
+            )
+            self.timestamp[idx] = timestamp_tensor
+            self.frame_ids[idx] = int(timestamp_tensor.item())
+            image_tensor = self._to_tensor(image, dtype=self.images.dtype)
+            self.images[idx] = image_tensor.cpu()
 
             if pose is not None:
-                self.poses[idx] = pose.to(self.device)
+                self.poses[idx] = self._to_tensor(
+                    pose, dtype=self.poses.dtype, device=self.device
+                )
 
             if disp is not None:
-                if torch.is_tensor(disp):
-                    self.disps[idx] = disp.to(self.device)
-                else:
-                    self.disps[idx] = torch.as_tensor(
-                        disp, device=self.device, dtype=self.disps.dtype
-                    )
+                self.disps[idx] = self._to_tensor(
+                    disp, dtype=self.disps.dtype, device=self.device
+                )
 
             if mono_depth is not None:
-                mono_depth = mono_depth.to(self.device)
+                mono_depth = self._to_tensor(
+                    mono_depth, dtype=self.mono_disps_up.dtype, device=self.device
+                )
                 mono_depth = mono_depth[self.slice_h, self.slice_w]
                 self.mono_disps[idx] = torch.where(mono_depth > 0, 1.0 / mono_depth, 0)
-                mono_depth_up = items[4][local_i].to(self.device)
+                mono_depth_up = self._to_tensor(
+                    items[4][local_i],
+                    dtype=self.mono_disps_up.dtype,
+                    device=self.device,
+                )
                 self.mono_disps_up[idx] = torch.where(mono_depth_up > 0, 1.0 / mono_depth_up, 0)
 
             if intrinsic is not None:
-                self.intrinsics[idx] = intrinsic.to(self.device)
+                self.intrinsics[idx] = self._to_tensor(
+                    intrinsic, dtype=self.intrinsics.dtype, device=self.device
+                )
 
             if fmap is not None:
-                self.fmaps[idx] = fmap.to(self.device)
+                self.fmaps[idx] = self._to_tensor(
+                    fmap, dtype=self.fmaps.dtype, device=self.device
+                )
 
             if net is not None:
-                self.nets[idx] = net.to(self.device)
+                self.nets[idx] = self._to_tensor(
+                    net, dtype=self.nets.dtype, device=self.device
+                )
 
             if inp is not None:
-                self.inps[idx] = inp.to(self.device)
+                self.inps[idx] = self._to_tensor(
+                    inp, dtype=self.inps.dtype, device=self.device
+                )
 
             if dino_feature is not None:
                 self._store_dino_feature(idx, dino_feature, frame_id=int(self.frame_ids[idx].item()))

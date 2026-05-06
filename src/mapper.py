@@ -10,6 +10,7 @@ from typing import Optional, Tuple, Union
 
 import cv2
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from munch import munchify
 from colorama import Fore, Style
@@ -34,6 +35,7 @@ from src.utils.datasets import get_dataset, load_metric_depth
 from src.utils.common import as_intrinsics_matrix, setup_seed
 from src.utils.Printer import Printer, FontColor
 from src.utils.pose_utils import update_pose
+from src.utils.dyn_uncertainty.uncertainty_model import generate_uncertainty_mlp
 from src.utils.slam_utils import (
     get_loss_mapping,
     get_loss_mapping_uncertainty,
@@ -53,7 +55,8 @@ class Mapper(object):
 
     def __init__(
         self, slam, packet_queue,
-        q_main2vis: Optional[mp.Queue] = None, q_vis2main: Optional[mp.Queue] = None
+        q_main2vis: Optional[mp.Queue] = None, q_vis2main: Optional[mp.Queue] = None,
+        uncer_network: Optional[nn.Module] = None,
     ):
         # setup seed
         setup_seed(slam.cfg["setup_seed"])
@@ -127,14 +130,42 @@ class Mapper(object):
         self.uncer_params = munchify(self.config["mapping"]["uncertainty_params"])
         self.uncertainty_aware = self.uncer_params["activate"]
         if self.uncertainty_aware:
+            self.teacher_consistency_mult = self.uncer_params.get(
+                "teacher_consistency_mult", 0.25
+            )
+            self.teacher_consistency_interval = max(
+                1, int(self.uncer_params.get("teacher_consistency_interval", 1))
+            )
+            self.teacher_consistency_start = int(
+                self.uncer_params.get("teacher_consistency_start", 0)
+            )
+            self.student_latent_dim = int(
+                self.uncer_params.get("latent_dim", 3)
+            )
+            self.uncer_network = uncer_network if uncer_network is not None else slam.uncer_network
+            if self.uncer_network is None:
+                self.uncer_network = generate_uncertainty_mlp(
+                    self.uncer_params["feature_dim"],
+                    latent_dim=self.student_latent_dim,
+                    hidden_dim=int(self.uncer_params.get("hidden_dim", 128)),
+                    net_depth=int(self.uncer_params.get("net_depth", 2)),
+                )
+            self.uncer_network = self.uncer_network.to(self.device)
+            self.uncer_network.train()
+            self.uncer_optimizer = torch.optim.Adam(
+                self.uncer_network.parameters(),
+                lr=self.uncer_params["lr"],
+                weight_decay=self.uncer_params["weight_decay"],
+            )
+
             self.vis_uncertainty_online = self.uncer_params["vis_uncertainty_online"]
+            self.video.set_uncer_network(self.uncer_network)
 
         # Setup queue object for gui communication
         self.q_main2vis = q_main2vis
         self.q_vis2main = q_vis2main
         self.pause = False
         self.pending_keyframes = {}
-        self.pending_beta_updates = {}
         self.next_kf_seq = 0
         self.mapper_initialized = False
         self.received_end = False
@@ -143,14 +174,12 @@ class Mapper(object):
         msg_type = message.get("type")
         if msg_type == "keyframe":
             self.pending_keyframes[int(message["kf_seq"])] = message
-        elif msg_type == "beta_update":
-            self.pending_beta_updates[int(message["kf_seq"])] = message
         elif msg_type == "end":
             self.received_end = True
         else:
             raise ValueError(f"Unknown mapper message type: {msg_type}")
 
-    def _append_local_keyframe(self, packet, beta_message):
+    def _append_local_keyframe(self, packet):
         frame_idx = int(packet["frame_id"])
         kf_seq = int(packet["kf_seq"])
         local_idx = self.video.counter.value
@@ -172,31 +201,132 @@ class Mapper(object):
             packet.get("dino_feature"),
         )
 
-        if beta_message is not None:
-            if beta_message.get("status") not in (None, "ok"):
-                raise RuntimeError(
-                    f"DINOv3 beta service error for kf_seq={kf_seq}: {beta_message.get('error', 'unknown')}"
-                )
-            if beta_message.get("features") is not None:
-                self.video.set_external_dino_feature(
-                    local_idx,
-                    beta_message["features"],
-                    frame_id=frame_idx,
-                )
-            if beta_message.get("beta") is not None:
-                self.video.set_external_beta(
-                    local_idx,
-                    beta_message["beta"],
-                    frame_id=frame_idx,
-                )
-
         return local_idx, frame_idx
+
+    def _predict_student_uncertainty(
+        self, features: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        uncertainty, latent = self.uncer_network(features.to(self.device))
+        uncertainty = torch.clamp(uncertainty, min=0.1) + 1e-3
+        return uncertainty, latent
+
+    def _teacher_latent_from_gaussians(
+        self, viewpoint: Camera, fallback_features: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        render_pkg = render(
+            viewpoint,
+            self.gaussians,
+            self.pipeline_params,
+            self.background,
+            override_color=self.gaussians.get_teacher_latent,
+        )
+        teacher_latent = render_pkg["render"]
+        if teacher_latent.dim() == 3 and teacher_latent.shape[0] in (1, 3):
+            return teacher_latent
+        if teacher_latent.dim() == 3 and teacher_latent.shape[-1] in (1, 3):
+            return teacher_latent.permute(2, 0, 1).contiguous()
+        raise ValueError(f"Unexpected teacher render shape: {teacher_latent.shape}")
+
+    def _teacher_student_consistency_loss(
+        self,
+        student_latent: torch.Tensor,
+        teacher_latent: torch.Tensor,
+        opacity: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        reduce: bool = True,
+    ) -> torch.Tensor:
+        teacher_latent = teacher_latent.to(student_latent.device)
+        if teacher_latent.dim() == 3 and teacher_latent.shape[0] == student_latent.shape[-1]:
+            teacher_latent = teacher_latent.permute(1, 2, 0).contiguous()
+        if teacher_latent.dim() != 3:
+            raise ValueError(f"Unexpected teacher latent shape: {teacher_latent.shape}")
+        if student_latent.dim() != 3:
+            raise ValueError(f"Unexpected student latent shape: {student_latent.shape}")
+
+        student_latent = F.normalize(student_latent, p=2, dim=-1)
+        teacher_latent = F.normalize(teacher_latent, p=2, dim=-1)
+        diff = 1.0 - (student_latent * teacher_latent).sum(dim=-1)
+        if mask is not None:
+            diff = diff * mask.float()
+        diff = diff * opacity.squeeze(0)
+        return diff.mean() if reduce else diff
+
+    def _maybe_update_student_from_keyframe(
+        self,
+        viewpoint: Camera,
+        render_pkg: dict,
+        train_frac: float,
+    ) -> Optional[torch.Tensor]:
+        if not self.uncertainty_aware:
+            return None
+
+        frame_id = int(self.video.timestamp[viewpoint.uid].item())
+        features = viewpoint.features
+        if features is None:
+            return None
+
+        uncertainty, student_latent = self._predict_student_uncertainty(features)
+        teacher_latent = self._teacher_latent_from_gaussians(viewpoint)
+        teacher_latent = teacher_latent.permute(1, 2, 0).contiguous()
+        if student_latent.dim() == 4:
+            student_latent = student_latent.squeeze(0)
+        if student_latent.shape[:2] != teacher_latent.shape[:2]:
+            student_latent = F.interpolate(
+                student_latent.permute(2, 0, 1).unsqueeze(0),
+                size=teacher_latent.shape[:2],
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0).permute(1, 2, 0).contiguous()
+        uncertainty = F.interpolate(
+            uncertainty.unsqueeze(0).unsqueeze(0),
+            size=teacher_latent.shape[:2],
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0).squeeze(0)
+
+        mask = render_pkg["opacity"].detach().squeeze(0) > self.uncer_params[
+            "opacity_th_for_uncer_loss"
+        ]
+        teacher_map = self._teacher_student_consistency_loss(
+            student_latent.detach(),
+            teacher_latent,
+            render_pkg["opacity"],
+            mask=mask,
+            reduce=False,
+        )
+        student_map = self._teacher_student_consistency_loss(
+            student_latent,
+            teacher_latent.detach(),
+            render_pkg["opacity"],
+            mask=mask,
+            reduce=False,
+        )
+        teacher_loss = teacher_map.mean()
+        student_loss = student_map.mean()
+
+        uncertainty_loss = F.smooth_l1_loss(uncertainty, teacher_map.detach())
+
+        if frame_id >= self.teacher_consistency_start and (
+            frame_id % self.teacher_consistency_interval == 0
+        ):
+            self.gaussians.optimizer.zero_grad(set_to_none=True)
+            teacher_loss.backward(retain_graph=True)
+            self.gaussians.optimizer.step()
+            self.gaussians.optimizer.zero_grad(set_to_none=True)
+
+            total = student_loss + self.teacher_consistency_mult * uncertainty_loss
+            self.uncer_optimizer.zero_grad(set_to_none=True)
+            total.backward()
+            self.uncer_optimizer.step()
+
+        return uncertainty.detach()
 
     def _process_online_keyframe(self, video_idx: int, frame_idx: int) -> None:
         if self.verbose:
             self.printer.print(f"\nMapping Frame {frame_idx} ...", FontColor.MAPPER)
 
         viewpoint, invalid = self._get_viewpoint(video_idx, frame_idx)
+        current_viewpoint = viewpoint
 
         if invalid:
             self.printer.print(
@@ -251,6 +381,21 @@ class Mapper(object):
             )
         self.keyframe_optimizers = torch.optim.Adam(opt_params)
 
+        if self.uncertainty_aware:
+            self._maybe_update_student_from_keyframe(
+                current_viewpoint,
+                render_pkg,
+                train_frac=self.uncer_params["train_frac_fix"],
+            )
+            ckpt_path = os.path.join(
+                self.config["data"]["output"],
+                self.config["scene"],
+                "uncertainty_student.pth",
+            )
+            tmp_path = ckpt_path + ".tmp"
+            torch.save(self.uncer_network.state_dict(), tmp_path)
+            os.replace(tmp_path, ckpt_path)
+
         if self.config["fast_mode"]:
             if video_idx % 4 == 0:
                 gaussian_split = self.map_opt_online(
@@ -274,13 +419,11 @@ class Mapper(object):
     def _flush_ready_packets(self):
         while True:
             packet = self.pending_keyframes.get(self.next_kf_seq)
-            beta_message = self.pending_beta_updates.get(self.next_kf_seq)
-            if packet is None or beta_message is None:
+            if packet is None:
                 return
 
             packet = self.pending_keyframes.pop(self.next_kf_seq)
-            beta_message = self.pending_beta_updates.pop(self.next_kf_seq)
-            video_idx, frame_idx = self._append_local_keyframe(packet, beta_message)
+            video_idx, frame_idx = self._append_local_keyframe(packet)
 
             if not self.mapper_initialized:
                 if packet.get("just_initialized", False):
@@ -318,12 +461,12 @@ class Mapper(object):
                 self._handle_packet_message(message)
             except queue.Empty:
                 self._flush_ready_packets()
-                if self.received_end and not self.pending_keyframes and not self.pending_beta_updates:
+                if self.received_end and not self.pending_keyframes:
                     break
                 continue
 
             self._flush_ready_packets()
-            if self.received_end and not self.pending_keyframes and not self.pending_beta_updates:
+            if self.received_end and not self.pending_keyframes:
                 break
 
         self.printer.print("Done with Mapping and Tracking", FontColor.MAPPER)

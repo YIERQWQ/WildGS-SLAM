@@ -19,6 +19,7 @@ from src.tracker import Tracker
 from src.mapper import Mapper
 from src.backend import Backend
 from src.utils.datasets import RGB_NoPose
+from src.utils.dyn_uncertainty.uncertainty_model import generate_uncertainty_mlp
 from thirdparty.gaussian_splatting.scene.gaussian_model import GaussianModel
 from src.utils.external_beta import ExternalDinoClient
 
@@ -58,12 +59,30 @@ class SLAM:
         self.all_trigered = torch.zeros((1)).int()
         self.all_trigered.share_memory_()
 
+        self.uncer_network = None
+        if self.cfg["mapping"]["uncertainty_params"]["activate"]:
+            n_features = self.cfg["mapping"]["uncertainty_params"]["feature_dim"]
+            latent_dim = int(self.cfg["mapping"]["uncertainty_params"].get("latent_dim", 3))
+            hidden_dim = int(self.cfg["mapping"]["uncertainty_params"].get("hidden_dim", 128))
+            net_depth = int(self.cfg["mapping"]["uncertainty_params"].get("net_depth", 2))
+            self.uncer_network = generate_uncertainty_mlp(
+                n_features,
+                latent_dim=latent_dim,
+                hidden_dim=hidden_dim,
+                net_depth=net_depth,
+            )
+            self.uncer_network.share_memory()
+            self.uncer_network.eval()
+
+        self._load_uncertainty_checkpoint()
+
         self.beta_cfg = cfg.get("beta_service", {})
         self.beta_client = None
         self.keyframe_queue = None
         self.video = DepthVideo(
             cfg,
             self.printer,
+            uncer_network=self.uncer_network,
             beta_client=None,
         )
         self.ba = Backend(self.droid_net, self.video, self.cfg)
@@ -82,6 +101,8 @@ class SLAM:
         self.stream = stream
 
     def _start_beta_client(self):
+        if self.uncer_network is not None:
+            return
         if not self.beta_cfg.get("activate", False):
             return
         if self.beta_client is not None:
@@ -105,6 +126,22 @@ class SLAM:
         self.beta_client.shutdown()
         self.beta_client = None
         self.video.set_beta_client(None)
+
+    def _uncertainty_ckpt_path(self) -> str:
+        return os.path.join(self.save_dir, "uncertainty_student.pth")
+
+    def _load_uncertainty_checkpoint(self) -> None:
+        if self.uncer_network is None:
+            return
+        ckpt_path = self._uncertainty_ckpt_path()
+        if os.path.exists(ckpt_path):
+            state = torch.load(ckpt_path, map_location=self.device, weights_only=True)
+            if isinstance(state, dict):
+                self.uncer_network.load_state_dict(state)
+                self.printer.print(
+                    f"Loaded uncertainty student checkpoint from {ckpt_path}",
+                    FontColor.INFO,
+                )
 
     def _load_tracker_stats(self):
         candidates = [os.path.join(self.save_dir, "tracker_metrics.json")]
@@ -265,6 +302,7 @@ class SLAM:
         self.video = DepthVideo(
             self.cfg,
             self.printer,
+            uncer_network=self.uncer_network,
             beta_client=None,
         )
         self.ba = Backend(self.droid_net, self.video, self.cfg)
@@ -276,7 +314,7 @@ class SLAM:
             device=self.device,
         )
         self.keyframe_queue = packet_queue
-        self.mapper = Mapper(self, packet_queue, q_main2vis, q_vis2main)
+        self.mapper = Mapper(self, packet_queue, q_main2vis, q_vis2main, self.uncer_network)
         self.printer.print("Mapping Triggered!", FontColor.MAPPER)
 
         self.all_trigered += 1
@@ -414,6 +452,8 @@ class SLAM:
             )
 
         self.mapper.gaussians.save_ply(f"{self.save_dir}/final_gs.ply")
+        if self.uncer_network is not None:
+            torch.save(self.uncer_network.state_dict(), self._uncertainty_ckpt_path())
 
         if tracker_stats is not None:
             tracker_section = ["##########Frontend summary##########"]

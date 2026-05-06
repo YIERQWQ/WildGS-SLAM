@@ -37,6 +37,9 @@ class Backend:
         self.backend_loop_thresh = cfg['tracking']['backend']['loop_thresh']
         self.backend_loop_radius = cfg['tracking']['backend']['loop_radius']
         self.backend_loop_nms = cfg['tracking']['backend']['loop_nms']
+        self.clear_cuda_cache_in_backend = bool(
+            cfg['tracking'].get('clear_cuda_cache_in_backend', False)
+        )
 
     @torch.no_grad()
     def backend_ba(self, t_start, t_end, steps, graph, nms, radius, thresh, max_factors, t_start_loop=None, loop=False, motion_only=False, enable_wq=True):
@@ -81,7 +84,8 @@ class Backend:
                           thresh, max_factors, motion_only=False, enable_wq=enable_wq)
 
         del graph
-        torch.cuda.empty_cache()
+        if self.clear_cuda_cache_in_backend:
+            torch.cuda.empty_cache()
         self.video.set_dirty(t_start,t_end)
         self.video.update_valid_depth_mask()
         return n, n_edges
@@ -111,6 +115,6 @@ class Backend:
                           left_factors, t_start_loop=t_start_loop, loop=True, 
                           motion_only=motion_only, enable_wq=enable_wq)
         del graph
-        torch.cuda.empty_cache()
+        if self.clear_cuda_cache_in_backend:
+            torch.cuda.empty_cache()
         return t_end - t_start_loop, n_edges
-

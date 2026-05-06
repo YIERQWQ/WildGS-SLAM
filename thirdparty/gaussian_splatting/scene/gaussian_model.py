@@ -36,10 +36,12 @@ class GaussianModel:
     def __init__(self, sh_degree: int, config=None):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
+        self.teacher_feat_dim = 3
 
         self._xyz = torch.empty(0, device="cuda")
         self._features_dc = torch.empty(0, device="cuda")
         self._features_rest = torch.empty(0, device="cuda")
+        self._teacher_latent = torch.empty(0, self.teacher_feat_dim, device="cuda")
         self._scaling = torch.empty(0, device="cuda")
         self._rotation = torch.empty(0, device="cuda")
         self._opacity = torch.empty(0, device="cuda")
@@ -91,6 +93,10 @@ class GaussianModel:
         features_dc = self._features_dc
         features_rest = self._features_rest
         return torch.cat((features_dc, features_rest), dim=1)
+
+    @property
+    def get_teacher_latent(self):
+        return self._teacher_latent
 
     @property
     def get_opacity(self):
@@ -223,13 +229,15 @@ class GaussianModel:
             )
         )
 
-        return fused_point_cloud, features, scales, rots, opacities
+        teacher_latent = torch.tanh(fused_color.clone())
+
+        return fused_point_cloud, features, teacher_latent, scales, rots, opacities
 
     def init_lr(self, spatial_lr_scale):
         self.spatial_lr_scale = spatial_lr_scale
 
     def extend_from_pcd(
-        self, fused_point_cloud, features, scales, rots, opacities, kf_id
+        self, fused_point_cloud, features, teacher_latent, scales, rots, opacities, kf_id
     ):
         new_xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         # the non-directional dependent component of the SH denoted "dc"
@@ -238,6 +246,9 @@ class GaussianModel:
         )
         new_features_rest = nn.Parameter(
             features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
+        )
+        new_teacher_latent = nn.Parameter(
+            teacher_latent.contiguous().requires_grad_(True)
         )
         new_scaling = nn.Parameter(scales.requires_grad_(True))
         new_rotation = nn.Parameter(rots.requires_grad_(True))
@@ -251,6 +262,7 @@ class GaussianModel:
             new_xyz,
             new_features_dc,
             new_features_rest,
+            new_teacher_latent,
             new_opacity,
             new_scaling,
             new_rotation,
@@ -261,11 +273,11 @@ class GaussianModel:
     def extend_from_pcd_seq(
         self, cam_info, kf_id=-1, init=False, scale=2.0, depthmap=None
     ):
-        fused_point_cloud, features, scales, rots, opacities = (
+        fused_point_cloud, features, teacher_latent, scales, rots, opacities = (
             self.create_pcd_from_image(cam_info, init, scale=scale, depthmap=depthmap)
         )
         self.extend_from_pcd(
-            fused_point_cloud, features, scales, rots, opacities, kf_id
+            fused_point_cloud, features, teacher_latent, scales, rots, opacities, kf_id
         )
 
     def training_setup(self, training_args):
@@ -288,6 +300,11 @@ class GaussianModel:
                 "params": [self._features_rest],
                 "lr": training_args.feature_lr / 20.0,
                 "name": "f_rest",
+            },
+            {
+                "params": [self._teacher_latent],
+                "lr": getattr(training_args, "teacher_feature_lr", training_args.feature_lr),
+                "name": "teacher_latent",
             },
             {
                 "params": [self._opacity],
@@ -342,6 +359,8 @@ class GaussianModel:
             l.append("f_dc_{}".format(i))
         for i in range(self._features_rest.shape[1] * self._features_rest.shape[2]):
             l.append("f_rest_{}".format(i))
+        for i in range(self._teacher_latent.shape[1]):
+            l.append("teacher_latent_{}".format(i))
         l.append("opacity")
         for i in range(self._scaling.shape[1]):
             l.append("scale_{}".format(i))
@@ -371,6 +390,7 @@ class GaussianModel:
             .cpu()
             .numpy()
         )
+        teacher_latent = self._teacher_latent.detach().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
@@ -380,7 +400,7 @@ class GaussianModel:
         ]
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         attributes = np.concatenate(
-            (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
+            (xyz, normals, f_dc, f_rest, teacher_latent, opacities, scale, rotation), axis=1
         )
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, "vertex")
@@ -443,6 +463,20 @@ class GaussianModel:
             (features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1)
         )
 
+        teacher_names = [
+            p.name
+            for p in plydata.elements[0].properties
+            if p.name.startswith("teacher_latent_")
+        ]
+        teacher_latent = None
+        if len(teacher_names) > 0:
+            teacher_names = sorted(teacher_names, key=lambda x: int(x.split("_")[-1]))
+            teacher_latent = np.zeros((xyz.shape[0], len(teacher_names)))
+            for idx, attr_name in enumerate(teacher_names):
+                teacher_latent[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        else:
+            teacher_latent = np.zeros((xyz.shape[0], self.teacher_feat_dim))
+
         scale_names = [
             p.name
             for p in plydata.elements[0].properties
@@ -474,6 +508,10 @@ class GaussianModel:
             torch.tensor(features_extra, dtype=torch.float, device="cuda")
             .transpose(1, 2)
             .contiguous()
+            .requires_grad_(True)
+        )
+        self._teacher_latent = nn.Parameter(
+            torch.tensor(teacher_latent, dtype=torch.float, device="cuda")
             .requires_grad_(True)
         )
         self._opacity = nn.Parameter(
@@ -552,6 +590,7 @@ class GaussianModel:
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
+        self._teacher_latent = optimizable_tensors["teacher_latent"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -604,6 +643,7 @@ class GaussianModel:
         new_xyz,
         new_features_dc,
         new_features_rest,
+        new_teacher_latent,
         new_opacities,
         new_scaling,
         new_rotation,
@@ -614,6 +654,7 @@ class GaussianModel:
             "xyz": new_xyz,
             "f_dc": new_features_dc,
             "f_rest": new_features_rest,
+            "teacher_latent": new_teacher_latent,
             "opacity": new_opacities,
             "scaling": new_scaling,
             "rotation": new_rotation,
@@ -628,6 +669,7 @@ class GaussianModel:
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
+        self._teacher_latent = optimizable_tensors["teacher_latent"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -668,6 +710,7 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
+        new_teacher_latent = self._teacher_latent[selected_pts_mask].repeat(N, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
 
         new_kf_id = self.unique_kfIDs[selected_pts_mask.cpu()].repeat(N)
@@ -678,6 +721,7 @@ class GaussianModel:
             new_xyz,
             new_features_dc,
             new_features_rest,
+            new_teacher_latent,
             new_opacity,
             new_scaling,
             new_rotation,
@@ -708,6 +752,7 @@ class GaussianModel:
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
+        new_teacher_latent = self._teacher_latent[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
@@ -718,6 +763,7 @@ class GaussianModel:
             new_xyz,
             new_features_dc,
             new_features_rest,
+            new_teacher_latent,
             new_opacities,
             new_scaling,
             new_rotation,

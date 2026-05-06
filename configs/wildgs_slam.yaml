@@ -69,7 +69,13 @@ mapping:
     feature_dim: 384
     feature_type: "dino"
     mapping_loss_type: "normalized_l1"
+    latent_dim: 3
+    hidden_dim: 128
+    net_depth: 2
     train_frac_fix: 0.3 # in the range of 0-1
+    teacher_consistency_mult: 0.25
+    teacher_consistency_interval: 1
+    teacher_consistency_start: 0
     ssim_window_size: 7
     ssim_median_filter_size: 5
     reg_stride: 2
@@ -77,6 +83,7 @@ mapping:
     reg_mult: 0.5
     ssim_mult: 0.5
     uncer_depth_mult: 0.2
+    mask_update_interval: 4
 
     lr: 0.0004
     weight_decay: 0.00001
@@ -97,6 +104,7 @@ tracking:
   frontend:
     enable_loop: True      # whether to enable loop closure
     enable_online_ba: True # whether to enable online bundle adjustment
+    loop_ba_interval: 4    # run loop BA every N keyframes
     keyframe_thresh: 3.0   # remove keyframe if it is too close to the last keyframe, i.e. avg flow < X pixels
     thresh: 16.0           # only consider edge with avg flow < X pixels
     window: 25             # local ba window size
@@ -119,6 +127,8 @@ tracking:
     #                See "get_w2c_and_depth" in mapper.py for detail.
     metric_depth_reg: True # whether to use metric depth to guide disparity in BA, always set to True
     normalize: False    # whether to normalize disps after each BA iter
+  clear_cuda_cache_in_frontend: False
+  clear_cuda_cache_in_backend: False
   uncertainty_params:
     activate: True
   force_keyframe_every_n_frames: 9 # set to negative value if you don't want to force to insert keyframes
