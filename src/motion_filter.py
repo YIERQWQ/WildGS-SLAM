@@ -29,14 +29,11 @@ class MotionFilter:
         self.MEAN = torch.as_tensor([0.485, 0.456, 0.406], device=self.device)[:, None, None]
         self.STDV = torch.as_tensor([0.229, 0.224, 0.225], device=self.device)[:, None, None]
         
-        self.uncertainty_aware = (
-            cfg['tracking']["uncertainty_params"]['activate']
-            or cfg['mapping']["uncertainty_params"]['activate']
-        )
+        self.uncertainty_aware = cfg['tracking']["uncertainty_params"]['activate']
         self.save_dir = cfg['data']['output'] + '/' + cfg['scene']
         self.metric_depth_estimator = get_metric_depth_estimator(cfg)
-        if self.uncertainty_aware:
-            # If mapping or tracking needs DINO features, keep the extractor alive.
+        if cfg['mapping']["uncertainty_params"]['activate']:
+            # If mapping needs DINO features, we still need feature extractor
             self.feat_extractor = get_feature_extractor(cfg)
 
     @torch.amp.autocast('cuda',enabled=True)

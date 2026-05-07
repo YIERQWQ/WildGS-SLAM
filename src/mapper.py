@@ -31,7 +31,7 @@ from thirdparty.gaussian_splatting.utils.graphics_utils import (
     getWorld2View2,
 )
 from src.depth_video import DepthVideo
-from src.utils.datasets import get_dataset, load_metric_depth
+from src.utils.datasets import get_dataset, load_metric_depth, load_img_feature
 from src.utils.common import as_intrinsics_matrix, setup_seed
 from src.utils.Printer import Printer, FontColor
 from src.utils.pose_utils import update_pose
@@ -366,17 +366,12 @@ class Mapper(object):
         # Load metric depth
         metric_depth = load_metric_depth(frame_idx, self.save_dir).to(self.device)
 
-        # Load DINOv3 features from mapper-local video state.
+        # Load features if uncertainty-aware
         if self.uncertainty_aware:
-            features = self.video.get_dino_feature(
-                video_idx,
-                resized=False,
-                frame_id=frame_idx,
-            )
-            if features is None:
-                raise RuntimeError(
-                    f"Missing DINOv3 features for keyframe video_idx={video_idx}, frame_id={frame_idx}"
-                )
+            load_feature_suffix = "full" if self.config["mapping"]["full_resolution"] else ""
+            features = load_img_feature(
+                frame_idx, self.save_dir, suffix=load_feature_suffix
+            ).to(self.device)
         else:
             features = None
 

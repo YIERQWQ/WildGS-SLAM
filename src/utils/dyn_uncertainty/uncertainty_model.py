@@ -33,12 +33,7 @@ class MLPNetwork(nn.Module):
         self.softplus = nn.Softplus()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Accept either HWC or CHW-style feature maps.
-        if x.dim() == 3 and x.shape[0] == self.input_dim and x.shape[-1] != self.input_dim:
-            x = x.permute(1, 2, 0).contiguous()
-        elif x.dim() == 4 and x.shape[1] == self.input_dim and x.shape[-1] != self.input_dim:
-            x = x.permute(0, 2, 3, 1).contiguous()
-
+        # Get input dimensions
         H, W, C = x.shape[-3:]
         input_with_batch_dim = True
         

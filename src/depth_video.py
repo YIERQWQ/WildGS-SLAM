@@ -240,7 +240,6 @@ class DepthVideo:
         w = self.images.shape[3]
         data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
         network_device = next(self.uncer_network.parameters()).device
-
         if isinstance(idxs, slice):
             start = 0 if idxs.start is None else int(idxs.start)
             stop = self.counter.value if idxs.stop is None else int(idxs.stop)
@@ -352,42 +351,48 @@ class DepthVideo:
             inp = items[8][local_i] if len(items) > 8 else None
             dino_feature = items[9][local_i] if len(items) > 9 else None
 
+            def _as_tensor(value, *, dtype=None):
+                if value is None:
+                    return None
+                if torch.is_tensor(value):
+                    tensor = value
+                else:
+                    tensor = torch.as_tensor(value)
+                if dtype is not None:
+                    tensor = tensor.to(dtype=dtype)
+                return tensor
+
             if torch.is_tensor(timestamp):
                 self.timestamp[idx] = timestamp.to(self.device)
             else:
                 self.timestamp[idx] = torch.as_tensor(timestamp, device=self.device)
             self.frame_ids[idx] = int(timestamp.item()) if torch.is_tensor(timestamp) else int(timestamp)
-            self.images[idx] = image.cpu()
+            self.images[idx] = _as_tensor(image, dtype=self.images.dtype).cpu()
 
             if pose is not None:
-                self.poses[idx] = pose.to(self.device)
+                self.poses[idx] = _as_tensor(pose, dtype=self.poses.dtype).to(self.device)
 
             if disp is not None:
-                if torch.is_tensor(disp):
-                    self.disps[idx] = disp.to(self.device)
-                else:
-                    self.disps[idx] = torch.as_tensor(
-                        disp, device=self.device, dtype=self.disps.dtype
-                    )
+                self.disps[idx] = _as_tensor(disp, dtype=self.disps.dtype).to(self.device)
 
             if mono_depth is not None:
-                mono_depth = mono_depth.to(self.device)
+                mono_depth = _as_tensor(mono_depth, dtype=torch.float32).to(self.device)
                 mono_depth = mono_depth[self.slice_h, self.slice_w]
                 self.mono_disps[idx] = torch.where(mono_depth > 0, 1.0 / mono_depth, 0)
-                mono_depth_up = items[4][local_i].to(self.device)
+                mono_depth_up = _as_tensor(items[4][local_i], dtype=torch.float32).to(self.device)
                 self.mono_disps_up[idx] = torch.where(mono_depth_up > 0, 1.0 / mono_depth_up, 0)
 
             if intrinsic is not None:
-                self.intrinsics[idx] = intrinsic.to(self.device)
+                self.intrinsics[idx] = _as_tensor(intrinsic, dtype=self.intrinsics.dtype).to(self.device)
 
             if fmap is not None:
-                self.fmaps[idx] = fmap.to(self.device)
+                self.fmaps[idx] = _as_tensor(fmap, dtype=self.fmaps.dtype).to(self.device)
 
             if net is not None:
-                self.nets[idx] = net.to(self.device)
+                self.nets[idx] = _as_tensor(net, dtype=self.nets.dtype).to(self.device)
 
             if inp is not None:
-                self.inps[idx] = inp.to(self.device)
+                self.inps[idx] = _as_tensor(inp, dtype=self.inps.dtype).to(self.device)
 
             if dino_feature is not None:
                 self._store_dino_feature(idx, dino_feature, frame_id=int(self.frame_ids[idx].item()))
@@ -708,14 +713,13 @@ class DepthVideo:
             # we only estimate uncertainty when we activate the mode
             raise Exception('This function should not be called if uncertainty aware is not activated')
         
-        network_device = next(self.uncer_network.parameters()).device
         i = 0
         while i*20 < self.counter.value:
             idxs = list(range(i * 20, min((i + 1) * 20, self.counter.value)))
             ready_idxs = []
             feature_batch = []
             for idx in idxs:
-                feature = self.get_dino_feature(idx, resized=True)
+                feature = self.get_dino_feature(idx, resized=False)
                 if feature is None:
                     continue
                 ready_idxs.append(idx)
@@ -723,6 +727,8 @@ class DepthVideo:
             if not ready_idxs:
                 i += 1
                 continue
+            idx_tensor = torch.as_tensor(ready_idxs, dtype=torch.long)
+            network_device = next(self.uncer_network.parameters()).device
             train_frac = self.cfg['mapping']['uncertainty_params']['train_frac_fix']
             with Lock():
                 uncer = self.uncer_network(
@@ -737,7 +743,7 @@ class DepthVideo:
             uncer = uncer[:, self.slice_h, self.slice_w]
             uncer = (uncer - 0.1) * data_rate + 0.1
             with self.get_lock():
-                self.uncertainties_inv[ready_idxs,:,:] = torch.clamp(0.5/uncer**2, 0.0, 1.0)
+                self.uncertainties_inv[idx_tensor, :, :] = torch.clamp(0.5/uncer**2, 0.0, 1.0)
 
             i += 1
 
@@ -767,13 +773,12 @@ class DepthVideo:
                 continue
             ready_idxs.append(idx)
             feature_batch.append(feature)
-
         if not ready_idxs:
             return
 
         idx_tensor = torch.as_tensor(ready_idxs, dtype=torch.long)
-        train_frac = self.cfg['mapping']['uncertainty_params']['train_frac_fix']
         network_device = next(self.uncer_network.parameters()).device
+        train_frac = self.cfg['mapping']['uncertainty_params']['train_frac_fix']
         with Lock():
             uncer = self.uncer_network(
                 torch.stack(feature_batch, dim=0).to(network_device)

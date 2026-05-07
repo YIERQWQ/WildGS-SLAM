@@ -68,6 +68,11 @@ class Tracker:
         first_keyframe_latency_s = None
         prev_ba_seq = 0
 
+        def _queue_copy(value):
+            if torch.is_tensor(value):
+                return value.detach().cpu().numpy()
+            return value
+
         intrinsic = stream.get_intrinsic()
         # for (timestamp, image, _, _) in tqdm(stream):
         for i in range(len(stream)):
@@ -124,19 +129,19 @@ class Tracker:
                             "type": "keyframe",
                             "kf_seq": kf_seq,
                             "video_idx": curr_kf_idx,
-                            "timestamp": snapshot["timestamp"],
-                            "frame_id": snapshot["frame_id"],
+                            "timestamp": _queue_copy(snapshot["timestamp"]),
+                            "frame_id": int(snapshot["frame_id"]),
                             "just_initialized": just_initialized,
                             "end": False,
-                            "image": snapshot["image"],
-                            "pose": snapshot["pose"],
-                            "disp": snapshot["disp"],
-                            "mono_depth": snapshot["mono_depth"],
-                            "intrinsic": snapshot["intrinsic"],
-                            "fmap": snapshot["fmap"],
-                            "net": snapshot["net"],
-                            "inp": snapshot["inp"],
-                            "dino_feature": snapshot.get("dino_feature"),
+                            "image": _queue_copy(snapshot["image"]),
+                            "pose": _queue_copy(snapshot["pose"]),
+                            "disp": _queue_copy(snapshot["disp"]),
+                            "mono_depth": _queue_copy(snapshot["mono_depth"]),
+                            "intrinsic": _queue_copy(snapshot["intrinsic"]),
+                            "fmap": _queue_copy(snapshot["fmap"]),
+                            "net": _queue_copy(snapshot["net"]),
+                            "inp": _queue_copy(snapshot["inp"]),
+                            "dino_feature": _queue_copy(snapshot.get("dino_feature")),
                         }
                     )
 
