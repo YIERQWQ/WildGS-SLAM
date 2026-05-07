@@ -3,6 +3,8 @@ import torch
 import argparse
 import os
 
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 from src import config
 from src.slam import SLAM
 from src.utils.datasets import get_dataset
@@ -53,4 +55,3 @@ if __name__ == '__main__':
 
     end_time = strftime("%Y-%m-%d %H:%M:%S", gmtime())
     print("-"*30+Fore.LIGHTRED_EX+f"\nWildGS-SLAM finishes!\n"+Style.RESET_ALL+f"{end_time}\n"+"-"*30)
-

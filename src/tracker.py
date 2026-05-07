@@ -106,9 +106,7 @@ class Tracker:
                         prev_ba_seq = kf_seq
 
                     snapshot = self.video.export_keyframe_snapshot(curr_kf_idx)
-                    if self.beta_client is not None and not bool(
-                        self.video.external_beta_valid[curr_kf_idx].item()
-                    ):
+                    if self.beta_client is not None:
                         submitted = self.beta_client.submit(
                             frame_id=snapshot["frame_id"],
                             video_idx=curr_kf_idx,
@@ -118,7 +116,7 @@ class Tracker:
                         )
                         if not submitted and self.verbose:
                             self.printer.print(
-                                f"Beta queue full, skip frame {snapshot['frame_id']}",
+                                f"DINOv3 queue full, skip frame {snapshot['frame_id']}",
                                 FontColor.TRACKER,
                             )
                     self.packet_queue.put(
@@ -158,18 +156,7 @@ class Tracker:
                 non_keyframe_elapsed_s += frame_time_s
 
         loop_end_s = time.perf_counter()
-
         if self.beta_client is not None:
-            deadline = time.time() + 5.0
-            while time.time() < deadline:
-                drained = self.beta_client.drain_results(max_items=256)
-                if (
-                    not drained
-                    and self.beta_client._request_q.empty()
-                    and self.beta_client._result_q.empty()
-                ):
-                    break
-                time.sleep(0.05)
             self.beta_client.drain_results(max_items=256)
 
         total_elapsed_s = loop_end_s - run_start

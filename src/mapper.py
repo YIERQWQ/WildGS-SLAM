@@ -10,6 +10,7 @@ from typing import Optional, Tuple, Union
 
 import cv2
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from munch import munchify
 from colorama import Fore, Style
@@ -52,7 +53,7 @@ class Mapper(object):
     """
 
     def __init__(
-        self, slam, packet_queue,
+        self, slam, packet_queue, uncer_network: Optional[nn.Module] = None,
         q_main2vis: Optional[mp.Queue] = None, q_vis2main: Optional[mp.Queue] = None
     ):
         # setup seed
@@ -65,9 +66,6 @@ class Mapper(object):
         self.verbose = slam.verbose
         self.device = torch.device(self.config["device"])
         self.video: DepthVideo = slam.video
-        self.beta_wait_timeout_s = self.config.get("beta_service", {}).get(
-            "timeout_s", 30.0
-        )
 
         # Set gaussian model
         self.model_params = munchify(self.config["mapping"]["model_params"])
@@ -128,13 +126,18 @@ class Mapper(object):
         self.uncertainty_aware = self.uncer_params["activate"]
         if self.uncertainty_aware:
             self.vis_uncertainty_online = self.uncer_params["vis_uncertainty_online"]
+            self.uncer_network = uncer_network
+            self.uncer_optimizer = torch.optim.Adam(
+                self.uncer_network.parameters(),
+                lr=self.uncer_params["lr"],
+                weight_decay=self.uncer_params["weight_decay"],
+            )
 
         # Setup queue object for gui communication
         self.q_main2vis = q_main2vis
         self.q_vis2main = q_vis2main
         self.pause = False
         self.pending_keyframes = {}
-        self.pending_beta_updates = {}
         self.next_kf_seq = 0
         self.mapper_initialized = False
         self.received_end = False
@@ -143,14 +146,12 @@ class Mapper(object):
         msg_type = message.get("type")
         if msg_type == "keyframe":
             self.pending_keyframes[int(message["kf_seq"])] = message
-        elif msg_type == "beta_update":
-            self.pending_beta_updates[int(message["kf_seq"])] = message
         elif msg_type == "end":
             self.received_end = True
         else:
             raise ValueError(f"Unknown mapper message type: {msg_type}")
 
-    def _append_local_keyframe(self, packet, beta_message):
+    def _append_local_keyframe(self, packet):
         frame_idx = int(packet["frame_id"])
         kf_seq = int(packet["kf_seq"])
         local_idx = self.video.counter.value
@@ -171,24 +172,6 @@ class Mapper(object):
             packet["inp"],
             packet.get("dino_feature"),
         )
-
-        if beta_message is not None:
-            if beta_message.get("status") not in (None, "ok"):
-                raise RuntimeError(
-                    f"DINOv3 beta service error for kf_seq={kf_seq}: {beta_message.get('error', 'unknown')}"
-                )
-            if beta_message.get("features") is not None:
-                self.video.set_external_dino_feature(
-                    local_idx,
-                    beta_message["features"],
-                    frame_id=frame_idx,
-                )
-            if beta_message.get("beta") is not None:
-                self.video.set_external_beta(
-                    local_idx,
-                    beta_message["beta"],
-                    frame_id=frame_idx,
-                )
 
         return local_idx, frame_idx
 
@@ -274,13 +257,11 @@ class Mapper(object):
     def _flush_ready_packets(self):
         while True:
             packet = self.pending_keyframes.get(self.next_kf_seq)
-            beta_message = self.pending_beta_updates.get(self.next_kf_seq)
-            if packet is None or beta_message is None:
+            if packet is None:
                 return
 
             packet = self.pending_keyframes.pop(self.next_kf_seq)
-            beta_message = self.pending_beta_updates.pop(self.next_kf_seq)
-            video_idx, frame_idx = self._append_local_keyframe(packet, beta_message)
+            video_idx, frame_idx = self._append_local_keyframe(packet)
 
             if not self.mapper_initialized:
                 if packet.get("just_initialized", False):
@@ -294,7 +275,7 @@ class Mapper(object):
 
     def run(self):
         """
-        Trigger mapping process with tracker packets and asynchronous beta updates.
+        Trigger mapping process with tracker packets.
         """
         self.frame_idxs = []  # the indices of keyframes in the original frame sequence
         self.video_idxs = []  # keyframe numbering (I sometimes call it kf_idx)
@@ -318,12 +299,12 @@ class Mapper(object):
                 self._handle_packet_message(message)
             except queue.Empty:
                 self._flush_ready_packets()
-                if self.received_end and not self.pending_keyframes and not self.pending_beta_updates:
+                if self.received_end and not self.pending_keyframes:
                     break
                 continue
 
             self._flush_ready_packets()
-            if self.received_end and not self.pending_keyframes and not self.pending_beta_updates:
+            if self.received_end and not self.pending_keyframes:
                 break
 
         self.printer.print("Done with Mapping and Tracking", FontColor.MAPPER)
@@ -903,14 +884,9 @@ class Mapper(object):
         # Using uncertainty only when uncertainty-aware tracking is activated
         if self.video.uncertainty_aware:
             with torch.no_grad():
-                keyframe_idx = self.video._frame_id_to_index(frame_idx)
-                if keyframe_idx is not None:
-                    uncer = self.video.get_external_beta(
-                        keyframe_idx,
-                        frame_id=frame_idx,
-                    )
-                else:
-                    uncer = self.video.interpolate_external_beta(frame_idx)
+                network_device = next(self.uncer_network.parameters()).device
+                features = features.to(network_device)
+                uncer = self.uncer_network(features).to(self.device)
                 uncer = torch.clip(uncer, min=0.1) + 1e-3
                 uncer_resized = F.interpolate(
                     uncer.unsqueeze(0).unsqueeze(0),
@@ -1052,13 +1028,10 @@ class Mapper(object):
                     depth,
                     viewpoint,
                     opacity,
+                    self.uncer_network,
                     train_frac,
                     ssim_frac,
                     initialization=True,
-                    uncertainty_override=self.video.get_external_beta(
-                        kf_idx,
-                        frame_id=frame_idx,
-                    ),
                 )
 
                 stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
@@ -1113,6 +1086,9 @@ class Mapper(object):
                 self.gaussians.update_learning_rate(self.iteration_count)
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
+                if self.uncertainty_aware:
+                    self.uncer_optimizer.step()
+                    self.uncer_optimizer.zero_grad()
 
                 self.frame_count_log[kf_idx] += 1
 
@@ -1212,13 +1188,10 @@ class Mapper(object):
                     depth,
                     viewpoint,
                     opacity,
+                    self.uncer_network,
                     train_frac,
                     ssim_frac,
                     freeze_uncertainty_loss=self.iterations_after_densify_or_reset < 20,
-                    uncertainty_override=self.video.get_external_beta(
-                        viewpoint.uid,
-                        frame_id=viewpoint.uid,
-                    ),
                 )
                 loss_mapping += current_loss_mapping
                 current_uncertainty = current_uncertainty.detach()
@@ -1235,13 +1208,13 @@ class Mapper(object):
                     ]
                     feature_buffer = []
                     uncer_buffer = []
+                    network_device = next(self.uncer_network.parameters()).device
                     for reg_view in reg_viewpoints:
                         reg_feature = reg_view.features.to(device=image.device)
                         reg_feature_sample = reg_feature[::stride, ::stride]
-                        reg_beta = self.video.get_external_beta(
-                            reg_view.uid,
-                            frame_id=reg_view.uid,
-                        )
+                        reg_beta = self.uncer_network(
+                            reg_feature.to(network_device)
+                        ).to(image.device)
                         reg_beta = F.interpolate(
                             reg_beta.unsqueeze(0).unsqueeze(0),
                             size=reg_feature.shape[:2],
@@ -1305,6 +1278,9 @@ class Mapper(object):
                 self.gaussians.update_learning_rate(self.iteration_count)
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
+                if self.uncertainty_aware:
+                    self.uncer_optimizer.step()
+                    self.uncer_optimizer.zero_grad()
 
             self.frame_count_log[viewpoint_kf_idx_stack[cam_idx]] += 1
 
@@ -1389,14 +1365,11 @@ class Mapper(object):
                     depth,
                     viewpoint,
                     opacity,
+                    self.uncer_network,
                     train_frac,
                     ssim_frac,
                     freeze_uncertainty_loss=self.iterations_after_densify_or_reset
                     < 200,
-                    uncertainty_override=self.video.get_external_beta(
-                        viewpoint.uid,
-                        frame_id=viewpoint.uid,
-                    ),
                 )
                 loss_mapping += loss_mapping_this_frame
                 current_uncertainty = current_uncertainty.detach()
@@ -1428,13 +1401,13 @@ class Mapper(object):
                 ]
                 feature_buffer = []
                 uncer_buffer = []
+                network_device = next(self.uncer_network.parameters()).device
                 for reg_view in reg_viewpoints:
                     reg_feature = reg_view.features.to(device=image.device)
                     reg_feature_sample = reg_feature[::stride, ::stride]
-                    reg_beta = self.video.get_external_beta(
-                        reg_view.uid,
-                        frame_id=reg_view.uid,
-                    )
+                    reg_beta = self.uncer_network(
+                        reg_feature.to(network_device)
+                    ).to(image.device)
                     reg_beta = F.interpolate(
                         reg_beta.unsqueeze(0).unsqueeze(0),
                         size=reg_feature.shape[:2],
@@ -1464,6 +1437,9 @@ class Mapper(object):
                 # Optimize the exposure compensation
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
+                if self.uncertainty_aware:
+                    self.uncer_optimizer.step()
+                    self.uncer_optimizer.zero_grad()
 
             for kf_idx in random_viewpoint_kf_idxs:
                 self.frame_count_log[kf_idx] += 1
@@ -1534,11 +1510,10 @@ class Mapper(object):
         """
         Compute the uncertainty for a given viewpoint without gradient computation.
         """
-        frame_id = int(self.video.timestamp[viewpoint.uid].item())
-        uncertainty = self.video.get_external_beta(
-            viewpoint.uid,
-            frame_id=frame_id,
-        )
+        network_device = next(self.uncer_network.parameters()).device
+        uncertainty = self.uncer_network(
+            viewpoint.features.to(network_device)
+        ).to(self.device)
 
         # Process uncertainty values
         uncertainty = torch.clip(uncertainty, min=0.1) + 1e-3

@@ -18,6 +18,7 @@ from src.utils.datasets import BaseDataset
 from src.tracker import Tracker
 from src.mapper import Mapper
 from src.backend import Backend
+from src.utils.dyn_uncertainty.uncertainty_model import generate_uncertainty_mlp
 from src.utils.datasets import RGB_NoPose
 from thirdparty.gaussian_splatting.scene.gaussian_model import GaussianModel
 from src.utils.external_beta import ExternalDinoClient
@@ -58,13 +59,18 @@ class SLAM:
         self.all_trigered = torch.zeros((1)).int()
         self.all_trigered.share_memory_()
 
-        self.beta_cfg = cfg.get("beta_service", {})
-        self.beta_client = None
+        if self.cfg["mapping"]["uncertainty_params"]["activate"]:
+            n_features = self.cfg["mapping"]["uncertainty_params"]["feature_dim"]
+            self.uncer_network = generate_uncertainty_mlp(n_features)
+            self.uncer_network.share_memory()
+        else:
+            self.uncer_network = None
+
         self.keyframe_queue = None
         self.video = DepthVideo(
             cfg,
             self.printer,
-            beta_client=None,
+            uncer_network=self.uncer_network,
         )
         self.ba = Backend(self.droid_net, self.video, self.cfg)
 
@@ -81,30 +87,8 @@ class SLAM:
         self.mapper: Mapper = None
         self.stream = stream
 
-    def _start_beta_client(self):
-        if not self.beta_cfg.get("activate", False):
-            return
-        if self.beta_client is not None:
-            return
-
-        self.beta_client = ExternalDinoClient(
-            host=self.beta_cfg.get("host", "127.0.0.1"),
-            port=self.beta_cfg.get("port", 5555),
-            authkey=self.beta_cfg.get("authkey", "wildgs-beta"),
-            jpeg_quality=self.beta_cfg.get("jpeg_quality", 90),
-            max_request_queue=self.beta_cfg.get("max_request_queue", 4096),
-            max_result_queue=self.beta_cfg.get("max_result_queue", 1024),
-        )
-        self.beta_client.on_result = self._handle_beta_result
-        self.video.set_beta_client(self.beta_client)
-        self.beta_client.start()
-
-    def _shutdown_beta_client(self):
-        if self.beta_client is None:
-            return
-        self.beta_client.shutdown()
+        self.beta_cfg = cfg.get("beta_service", {})
         self.beta_client = None
-        self.video.set_beta_client(None)
 
     def _load_tracker_stats(self):
         candidates = [os.path.join(self.save_dir, "tracker_metrics.json")]
@@ -160,62 +144,6 @@ class SLAM:
         lines.append("#" * 34)
         return "\n".join(lines)
 
-    def _handle_beta_result(self, result):
-        status = result.get("status", "ok")
-        frame_id = result.get("frame_id", None)
-        video_idx = result.get("video_idx", None)
-        kf_seq = result.get("kf_seq", None)
-        if status != "ok":
-            self.printer.print(
-                f"DINOv3 beta service error for frame {frame_id}: {result.get('error', 'unknown')}",
-                FontColor.ERROR,
-            )
-            if self.keyframe_queue is not None and kf_seq is not None:
-                self.keyframe_queue.put(
-                    {
-                        "type": "beta_update",
-                        "kf_seq": int(kf_seq),
-                        "frame_id": int(frame_id) if frame_id is not None else None,
-                        "video_idx": int(video_idx) if video_idx is not None else None,
-                        "status": status,
-                        "error": result.get("error", "unknown"),
-                        "beta": None,
-                        "features": None,
-                    }
-                )
-            return
-        if frame_id is None or video_idx is None:
-            self.printer.print(
-                "DINOv3 beta result missing frame_id or video_idx",
-                FontColor.ERROR,
-            )
-            return
-        beta = result.get("beta", None)
-        features = result.get("features", None)
-        if features is not None:
-            self.video.set_external_dino_feature(
-                int(video_idx),
-                features,
-                frame_id=int(frame_id),
-            )
-        if beta is not None:
-            self.video.set_external_beta(
-                int(video_idx),
-                beta,
-                frame_id=int(frame_id),
-            )
-        if self.keyframe_queue is not None and kf_seq is not None:
-            self.keyframe_queue.put(
-                {
-                    "type": "beta_update",
-                    "kf_seq": int(kf_seq),
-                    "frame_id": int(frame_id) if frame_id is not None else None,
-                    "video_idx": int(video_idx) if video_idx is not None else None,
-                    "beta": beta,
-                    "features": features,
-                }
-            )
-
     def load_pretrained(self, cfg):
         droid_pretrained = cfg["tracking"]["pretrained"]
         state_dict = OrderedDict(
@@ -233,6 +161,43 @@ class SLAM:
         self.printer.print(
             f"Load droid pretrained checkpoint from {droid_pretrained}!", FontColor.INFO
         )
+
+    def _start_beta_client(self):
+        if not self.beta_cfg.get("activate", False) or self.beta_client is not None:
+            return
+
+        self.beta_client = ExternalDinoClient(
+            host=self.beta_cfg.get("host", "127.0.0.1"),
+            port=self.beta_cfg.get("port", 5555),
+            authkey=self.beta_cfg.get("authkey", "wildgs-beta"),
+            jpeg_quality=self.beta_cfg.get("jpeg_quality", 90),
+            max_request_queue=self.beta_cfg.get("max_request_queue", 4096),
+            max_result_queue=self.beta_cfg.get("max_result_queue", 1024),
+        )
+        self.beta_client.on_result = self._handle_beta_result
+        self.beta_client.start()
+
+    def _shutdown_beta_client(self):
+        if self.beta_client is None:
+            return
+        self.beta_client.shutdown()
+        self.beta_client = None
+
+    def _handle_beta_result(self, result):
+        status = result.get("status", "ok")
+        if status != "ok":
+            self.printer.print(
+                f"DINOv3 beta service error for frame {result.get('frame_id')}: {result.get('error', 'unknown')}",
+                FontColor.ERROR,
+            )
+            return
+        features = result.get("features", None)
+        if features is not None and self.video is not None:
+            self.video.set_external_dino_feature(
+                int(result.get("video_idx", result.get("frame_id", 0))),
+                features,
+                frame_id=result.get("frame_id", None),
+            )
 
     def tracking(self, keyframe_queue):
         self.keyframe_queue = keyframe_queue
@@ -265,7 +230,7 @@ class SLAM:
         self.video = DepthVideo(
             self.cfg,
             self.printer,
-            beta_client=None,
+            uncer_network=self.uncer_network,
         )
         self.ba = Backend(self.droid_net, self.video, self.cfg)
         self.traj_filler = PoseTrajectoryFiller(
@@ -276,7 +241,7 @@ class SLAM:
             device=self.device,
         )
         self.keyframe_queue = packet_queue
-        self.mapper = Mapper(self, packet_queue, q_main2vis, q_vis2main)
+        self.mapper = Mapper(self, packet_queue, self.uncer_network, q_main2vis, q_vis2main)
         self.printer.print("Mapping Triggered!", FontColor.MAPPER)
 
         self.all_trigered += 1
@@ -415,6 +380,12 @@ class SLAM:
 
         self.mapper.gaussians.save_ply(f"{self.save_dir}/final_gs.ply")
 
+        if self.cfg["mapping"]["uncertainty_params"]["activate"]:
+            torch.save(
+                self.uncer_network.state_dict(),
+                self.save_dir + "/uncertainty_mlp_weight.pth",
+            )
+
         if tracker_stats is not None:
             tracker_section = ["##########Frontend summary##########"]
             for key in [
@@ -441,9 +412,6 @@ class SLAM:
             FontColor.EVAL,
         )
         self._mirror_run_artifacts()
-
-        if self.beta_client is not None:
-            self.beta_client.shutdown()
 
         self.printer.print("Metrics Evaluation Done!", FontColor.EVAL)
 

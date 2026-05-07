@@ -199,8 +199,6 @@ class FactorGraph:
                 self.video.dino_feats[ix] = self.video.dino_feats[ix+1]
                 self.video.dino_feats_resize[ix] = self.video.dino_feats_resize[ix+1]
                 self.video.dino_feats_valid[ix] = self.video.dino_feats_valid[ix+1]
-            self.video.external_beta[ix] = self.video.external_beta[ix+1]
-            self.video.external_beta_valid[ix] = self.video.external_beta_valid[ix+1]
             self.video.uncertainties_inv[ix] = self.video.uncertainties_inv[ix+1]
 
         m = (self.ii_inac == ix) | (self.jj_inac == ix)

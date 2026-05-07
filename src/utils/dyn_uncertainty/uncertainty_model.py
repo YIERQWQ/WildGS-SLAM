@@ -6,7 +6,7 @@ class MLPNetwork(nn.Module):
     def __init__(self, input_dim: int = 384, hidden_dim: int = 64, output_dim: int = 1, 
                  net_depth: int = 2, net_activation=F.relu, weight_init: str = 'he_uniform'):
         super(MLPNetwork, self).__init__()
-        
+        self.input_dim = input_dim
         self.output_layer_input_dim = hidden_dim
         
         # Initialize MLP layers
@@ -33,7 +33,12 @@ class MLPNetwork(nn.Module):
         self.softplus = nn.Softplus()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Get input dimensions
+        # Accept either HWC or CHW-style feature maps.
+        if x.dim() == 3 and x.shape[0] == self.input_dim and x.shape[-1] != self.input_dim:
+            x = x.permute(1, 2, 0).contiguous()
+        elif x.dim() == 4 and x.shape[1] == self.input_dim and x.shape[-1] != self.input_dim:
+            x = x.permute(0, 2, 3, 1).contiguous()
+
         H, W, C = x.shape[-3:]
         input_with_batch_dim = True
         

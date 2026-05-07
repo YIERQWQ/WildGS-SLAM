@@ -16,12 +16,11 @@ import src.geom.projective_ops as pops
 from src.utils.common import align_scale_and_shift
 from src.utils.Printer import FontColor
 from src.utils.dyn_uncertainty import mapping_utils as map_utils
-from src.utils.external_beta import decode_beta_payload
 
 class DepthVideo:
     ''' store the estimated poses and depth maps, 
         shared between tracker and mapper '''
-    def __init__(self, cfg, printer, beta_client=None):
+    def __init__(self, cfg, printer, uncer_network=None, beta_client=None):
         self.cfg =cfg
         self.output = f"{cfg['data']['output']}/{cfg['scene']}"
         ht = cfg['cam']['H_out']
@@ -71,16 +70,14 @@ class DepthVideo:
         # initialize poses to identity transformation
         self.poses[:] = torch.as_tensor([0, 0, 0, 0, 0, 0, 1], dtype=torch.float, device=self.device)
         self.printer = printer
-        self.beta_client = beta_client
+        self.uncer_network = uncer_network
         
         self.uncertainty_aware = (
             cfg['tracking']["uncertainty_params"]['activate']
             or cfg['mapping']["uncertainty_params"]['activate']
         )
         self.feature_output_dir = os.path.join(self.output, "mono_priors", "features")
-        self.beta_output_dir = os.path.join(self.output, "mono_priors", "betas")
         os.makedirs(self.feature_output_dir, exist_ok=True)
-        os.makedirs(self.beta_output_dir, exist_ok=True)
         if self.uncertainty_aware:
             n_features = self.cfg["mapping"]["uncertainty_params"]['feature_dim']
             
@@ -101,12 +98,6 @@ class DepthVideo:
             self.dino_feats_resize = None
             self.dino_feats_valid = None
 
-        self.external_beta = torch.zeros(buffer, ht // self.down_scale, wd // self.down_scale, device='cpu', dtype=torch.float).share_memory_()
-        self.external_beta_valid = torch.zeros(buffer, dtype=torch.bool, device='cpu').share_memory_()
-
-    def set_beta_client(self, beta_client) -> None:
-        self.beta_client = beta_client
-
     def export_keyframe_snapshot(self, index: int) -> Dict[str, Any]:
         with self.get_lock():
             if index < 0 or index >= self.counter.value:
@@ -118,13 +109,18 @@ class DepthVideo:
                 and bool(self.dino_feats_valid[index].item())
             ):
                 dino_feature = self.dino_feats[index].detach().cpu().clone()
+            mono_depth = torch.where(
+                self.mono_disps_up[index] > 0,
+                1.0 / self.mono_disps_up[index],
+                0.0,
+            ).detach().cpu().clone()
             return {
                 "timestamp": self.timestamp[index].detach().cpu().clone(),
                 "frame_id": int(self.frame_ids[index].item()),
                 "image": self.images[index].detach().cpu().clone(),
                 "pose": self.poses[index].detach().cpu().clone(),
                 "disp": self.disps[index].detach().cpu().clone(),
-                "mono_depth": self.mono_disps_up[index].detach().cpu().clone(),
+                "mono_depth": mono_depth,
                 "intrinsic": self.intrinsics[index].detach().cpu().clone(),
                 "fmap": self.fmaps[index].detach().cpu().clone(),
                 "net": self.nets[index].detach().cpu().clone(),
@@ -144,20 +140,6 @@ class DepthVideo:
                 return None
             return int(matches[0].item())
 
-    def _copy_external_beta_if_available(
-        self, index: int, frame_id: Optional[int] = None
-    ) -> Optional[torch.Tensor]:
-        if frame_id is not None:
-            resolved = self._frame_id_to_index(frame_id)
-            if resolved is not None:
-                index = resolved
-        with self.get_lock():
-            if index < 0 or index >= self.counter.value:
-                return None
-            if not bool(self.external_beta_valid[index].item()):
-                return None
-            return self.external_beta[index].clone()
-
     def _copy_dino_feature_if_available(
         self, index: int, frame_id: Optional[int] = None, resized: bool = True
     ) -> Optional[torch.Tensor]:
@@ -175,25 +157,6 @@ class DepthVideo:
             if resized:
                 return self.dino_feats_resize[index].clone()
             return self.dino_feats[index].clone()
-
-    def wait_for_external_beta(
-        self,
-        index: int,
-        frame_id: Optional[int] = None,
-        timeout_s: float = 30.0,
-        poll_interval_s: float = 0.01,
-    ) -> torch.Tensor:
-        deadline = time.time() + float(timeout_s)
-        while True:
-            beta = self._copy_external_beta_if_available(index, frame_id=frame_id)
-            if beta is not None:
-                return beta.to(self.device)
-            if time.time() > deadline:
-                ident = f"index={index}"
-                if frame_id is not None:
-                    ident += f", frame_id={frame_id}"
-                raise RuntimeError(f"Missing DINOv3 beta for {ident}")
-            time.sleep(poll_interval_s)
 
     def wait_for_dino_feature(
         self,
@@ -218,91 +181,6 @@ class DepthVideo:
                     ident += f", frame_id={frame_id}"
                 raise RuntimeError(f"Missing DINOv3 feature for {ident}")
             time.sleep(poll_interval_s)
-
-    def _ready_beta_indices(self, idxs) -> list[int]:
-        if isinstance(idxs, slice):
-            start = 0 if idxs.start is None else int(idxs.start)
-            stop = self.counter.value if idxs.stop is None else int(idxs.stop)
-            step = 1 if idxs.step is None else int(idxs.step)
-            idx_list = list(range(start, stop, step))
-        elif torch.is_tensor(idxs):
-            idx_list = [int(x) for x in idxs.detach().cpu().flatten().tolist()]
-        elif isinstance(idxs, int):
-            idx_list = [int(idxs)]
-        else:
-            idx_list = [int(x) for x in idxs]
-
-        return [idx for idx in idx_list if bool(self.external_beta_valid[idx].item())]
-
-    def _beta_for_index(self, index: int) -> Optional[torch.Tensor]:
-        if bool(self.external_beta_valid[index].item()):
-            return self.external_beta[index].clone().to(self.device)
-
-        frame_id = int(self.frame_ids[index].item())
-        try:
-            return self.interpolate_external_beta(frame_id)
-        except RuntimeError:
-            return None
-
-    def _uncertainty_from_beta_batch(
-        self, beta_batch: torch.Tensor, train_frac: float
-    ) -> torch.Tensor:
-        h = self.images.shape[2]
-        w = self.images.shape[3]
-        data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
-
-        beta_batch = torch.clip(beta_batch, min=0.1) + 1e-3
-        beta_full = F.interpolate(
-            beta_batch.unsqueeze(1),
-            size=(h, w),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(1)
-        return (beta_full - 0.1) * data_rate + 0.1
-
-    def interpolate_external_beta(self, frame_id: int) -> torch.Tensor:
-        frame_id = int(frame_id)
-        with self.get_lock():
-            count = int(self.counter.value)
-            if count == 0:
-                raise RuntimeError("Cannot interpolate beta without any keyframes")
-            frame_ids = self.frame_ids[:count].detach().cpu().tolist()
-            valid_mask = self.external_beta_valid[:count].detach().cpu().tolist()
-
-        valid_indices = [i for i, valid in enumerate(valid_mask) if valid]
-        if not valid_indices:
-            raise RuntimeError("Cannot interpolate beta because no keyframe beta is available")
-
-        position = bisect_left(frame_ids, frame_id)
-        left_idx = None
-        for i in range(position - 1, -1, -1):
-            if valid_mask[i]:
-                left_idx = i
-                break
-        right_idx = None
-        for i in range(position, count):
-            if valid_mask[i]:
-                right_idx = i
-                break
-
-        if left_idx is None and right_idx is None:
-            raise RuntimeError(f"Cannot interpolate beta for frame_id={frame_id}")
-
-        if left_idx is None:
-            return self.get_external_beta(right_idx, frame_id=int(frame_ids[right_idx]))
-        if right_idx is None:
-            return self.get_external_beta(left_idx, frame_id=int(frame_ids[left_idx]))
-
-        left_frame = int(frame_ids[left_idx])
-        right_frame = int(frame_ids[right_idx])
-        if right_frame == left_frame:
-            return self.get_external_beta(left_idx, frame_id=left_frame)
-
-        beta_left = self.get_external_beta(left_idx, frame_id=left_frame)
-        beta_right = self.get_external_beta(right_idx, frame_id=right_frame)
-        weight = float(frame_id - left_frame) / float(right_frame - left_frame)
-        weight = float(np.clip(weight, 0.0, 1.0))
-        return ((1.0 - weight) * beta_left + weight * beta_right).contiguous()
 
     def _store_dino_feature(self, index: int, feature: torch.Tensor, frame_id: Optional[int] = None) -> None:
         if feature is None:
@@ -355,72 +233,13 @@ class DepthVideo:
                 index = resolved
             elif index >= self.counter.value or int(self.frame_ids[index].item()) != int(frame_id):
                 return
-        with self.get_lock():
-            if index < 0 or index >= self.external_beta.shape[0]:
-                return
-            self.external_beta_valid[index] = False
         self._store_dino_feature(index, feature, frame_id=frame_id)
-
-    def set_external_beta(self, index: int, beta: torch.Tensor, frame_id: Optional[int] = None) -> None:
-        if beta is None:
-            return
-        if frame_id is not None:
-            resolved = self._frame_id_to_index(frame_id)
-            if resolved is not None:
-                index = resolved
-            elif index >= self.counter.value or int(self.frame_ids[index].item()) != int(frame_id):
-                return
-        beta_arr = decode_beta_payload(beta)
-        beta_tensor = torch.from_numpy(beta_arr).float()
-        if beta_tensor.dim() == 3 and beta_tensor.shape[0] == 1:
-            beta_tensor = beta_tensor[0]
-        if self.uncertainties_inv is not None and beta_tensor.shape != self.uncertainties_inv[index].shape:
-            beta_tensor = F.interpolate(
-                beta_tensor.unsqueeze(0).unsqueeze(0),
-                size=self.uncertainties_inv[index].shape,
-                mode='bilinear',
-                align_corners=False,
-                ).squeeze(0).squeeze(0)
-        with self.get_lock():
-            self.external_beta[index] = beta_tensor.cpu()
-            self.external_beta_valid[index] = True
-        if frame_id is None:
-            frame_id = int(self.frame_ids[index].item())
-        if frame_id >= 0:
-            np.save(
-                os.path.join(self.beta_output_dir, f"{int(frame_id):05d}.npy"),
-                beta_tensor.cpu().numpy(),
-            )
-        if self.uncertainties_inv is not None:
-            self.update_uncertainty_mask_given_index(index)
-
-    def get_external_beta(
-        self,
-        index: int,
-        frame_id: Optional[int] = None,
-    ) -> torch.Tensor:
-        beta = self._copy_external_beta_if_available(index, frame_id=frame_id)
-        if beta is None:
-            if frame_id is not None and self._frame_id_to_index(frame_id) is None:
-                raise RuntimeError(
-                    f"Missing DINOv3 beta for non-keyframe frame_id={int(frame_id)}; "
-                    "use interpolate_external_beta instead"
-                )
-            raise RuntimeError(
-                f"Missing DINOv3 beta for keyframe index={int(index)}"
-                + (f", frame_id={int(frame_id)}" if frame_id is not None else "")
-            )
-        return beta.to(self.device)
-
-    def poll_beta_client(self, max_items: int = 32) -> int:
-        if self.beta_client is None:
-            return 0
-        return self.beta_client.poll(max_items=max_items)
 
     def _compute_uncertainty_full_res(self, idxs, train_frac: float) -> torch.Tensor:
         h = self.images.shape[2]
         w = self.images.shape[3]
         data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
+        network_device = next(self.uncer_network.parameters()).device
 
         if isinstance(idxs, slice):
             start = 0 if idxs.start is None else int(idxs.start)
@@ -437,16 +256,27 @@ class DepthVideo:
         if len(idx_list) == 0:
             return torch.empty(0, h, w, device=self.device)
 
-        beta_batch = self.external_beta[idx_list].to(self.device)
-        beta_batch = torch.clip(beta_batch, min=0.1) + 1e-3
-        beta_full = F.interpolate(
-            beta_batch.unsqueeze(1),
-            size=(h, w),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(1)
-        beta_full = (beta_full - 0.1) * data_rate + 0.1
-        return beta_full
+        feature_batch = []
+        ready_idxs = []
+        for idx in idx_list:
+            feature = self.get_dino_feature(idx, resized=True)
+            if feature is None:
+                continue
+            ready_idxs.append(idx)
+            feature_batch.append(feature)
+        if not ready_idxs:
+            return torch.empty(0, h, w, device=self.device)
+        with Lock():
+            uncer = self.uncer_network(
+                torch.stack(feature_batch, dim=0).to(network_device)
+            ).to(self.device)
+        uncer = torch.clip(uncer, min=0.1) + 1e-3
+        uncer = uncer.unsqueeze(1)
+        uncer = F.interpolate(uncer, size=(h, w), mode="bilinear").squeeze(1).detach()
+        data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
+        uncer = uncer[:, self.slice_h, self.slice_w]
+        uncer = (uncer - 0.1) * data_rate + 0.1
+        return uncer
 
     def has_dino_feature(self, index: int) -> bool:
         if self.dino_feats_valid is None:
@@ -458,14 +288,14 @@ class DepthVideo:
             idx = self._frame_id_to_index(frame_id)
             if idx is not None and self.dino_feats_valid is not None and self.dino_feats_valid[idx]:
                 if resized:
-                    return self.dino_feats_resize[idx].to(self.device)
+                    return self.dino_feats_resize[idx].to(self.device).permute(1, 2, 0).contiguous()
                 return self.dino_feats[idx].to(self.device)
         if self.dino_feats is None or self.dino_feats_valid is None:
             return None
         if not self.dino_feats_valid[index]:
             return None
         if resized:
-            return self.dino_feats_resize[index].to(self.device)
+            return self.dino_feats_resize[index].to(self.device).permute(1, 2, 0).contiguous()
         return self.dino_feats[index].to(self.device)
 
     def get_lock(self):
@@ -511,9 +341,6 @@ class DepthVideo:
                     self.dino_feats_valid[idx] = False
                     self.dino_feats[idx].zero_()
                     self.dino_feats_resize[idx].zero_()
-            self.external_beta_valid[idx] = False
-            self.external_beta[idx].zero_()
-
             timestamp = items[0][local_i]
             image = items[1][local_i]
             pose = items[2][local_i]
@@ -881,25 +708,34 @@ class DepthVideo:
             # we only estimate uncertainty when we activate the mode
             raise Exception('This function should not be called if uncertainty aware is not activated')
         
+        network_device = next(self.uncer_network.parameters()).device
         i = 0
         while i*20 < self.counter.value:
             idxs = list(range(i * 20, min((i + 1) * 20, self.counter.value)))
             ready_idxs = []
-            beta_batch = []
+            feature_batch = []
             for idx in idxs:
-                beta = self._beta_for_index(idx)
-                if beta is None:
+                feature = self.get_dino_feature(idx, resized=True)
+                if feature is None:
                     continue
                 ready_idxs.append(idx)
-                beta_batch.append(beta)
+                feature_batch.append(feature)
             if not ready_idxs:
                 i += 1
                 continue
             train_frac = self.cfg['mapping']['uncertainty_params']['train_frac_fix']
-            uncer = self._uncertainty_from_beta_batch(
-                torch.stack(beta_batch, dim=0), train_frac
-            )
-            uncer = uncer[:, self.slice_h, self.slice_w].detach()
+            with Lock():
+                uncer = self.uncer_network(
+                    torch.stack(feature_batch, dim=0).to(network_device)
+                ).to(self.device)
+            uncer = torch.clip(uncer, min=0.1) + 1e-3
+            uncer = uncer.unsqueeze(1)
+            uncer = F.interpolate(
+                uncer, size=(self.images.shape[2], self.images.shape[3]), mode="bilinear"
+            ).squeeze(1).detach()
+            data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
+            uncer = uncer[:, self.slice_h, self.slice_w]
+            uncer = (uncer - 0.1) * data_rate + 0.1
             with self.get_lock():
                 self.uncertainties_inv[ready_idxs,:,:] = torch.clamp(0.5/uncer**2, 0.0, 1.0)
 
@@ -924,23 +760,32 @@ class DepthVideo:
             idx_list = [int(x) for x in idxs]
 
         ready_idxs = []
-        beta_batch = []
+        feature_batch = []
         for idx in idx_list:
-            beta = self._beta_for_index(idx)
-            if beta is None:
+            feature = self.get_dino_feature(idx, resized=True)
+            if feature is None:
                 continue
             ready_idxs.append(idx)
-            beta_batch.append(beta)
+            feature_batch.append(feature)
 
         if not ready_idxs:
             return
 
         idx_tensor = torch.as_tensor(ready_idxs, dtype=torch.long)
         train_frac = self.cfg['mapping']['uncertainty_params']['train_frac_fix']
-        uncer = self._uncertainty_from_beta_batch(
-            torch.stack(beta_batch, dim=0), train_frac
-        )
-        uncer = uncer[:, self.slice_h, self.slice_w].detach()
+        network_device = next(self.uncer_network.parameters()).device
+        with Lock():
+            uncer = self.uncer_network(
+                torch.stack(feature_batch, dim=0).to(network_device)
+            ).to(self.device)
+        uncer = torch.clip(uncer, min=0.1) + 1e-3
+        uncer = uncer.unsqueeze(1)
+        uncer = F.interpolate(
+            uncer, size=(self.images.shape[2], self.images.shape[3]), mode="bilinear"
+        ).squeeze(1).detach()
+        data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
+        uncer = uncer[:, self.slice_h, self.slice_w]
+        uncer = (uncer - 0.1) * data_rate + 0.1
         with self.get_lock():
             self.uncertainties_inv[idx_tensor,:,:] = torch.clamp(0.5/uncer**2, 0.0, 1.0)
 
