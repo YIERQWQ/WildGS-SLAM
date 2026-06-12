@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 
 class MLPNetwork(nn.Module):
-    """Per-pixel student head for dynamic uncertainty plus a 3D-aware latent."""
+    """Per-pixel student head for dynamic uncertainty."""
 
     def __init__(
         self,
@@ -21,7 +21,6 @@ class MLPNetwork(nn.Module):
 
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.latent_dim = latent_dim
         self.net_activation = net_activation
         self.softplus = nn.Softplus()
 
@@ -40,11 +39,8 @@ class MLPNetwork(nn.Module):
             self.layers.append(dense_layer)
 
         self.uncertainty_head = nn.Linear(hidden_dim, 1)
-        self.latent_head = nn.Linear(hidden_dim, latent_dim)
         nn.init.kaiming_uniform_(self.uncertainty_head.weight, nonlinearity="relu")
         nn.init.zeros_(self.uncertainty_head.bias)
-        nn.init.xavier_uniform_(self.latent_head.weight)
-        nn.init.zeros_(self.latent_head.bias)
 
     def _flatten_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, ...], bool]:
         if x.dim() == 3:
@@ -71,19 +67,15 @@ class MLPNetwork(nn.Module):
         for layer in self.layers:
             x_flat = layer(x_flat)
             x_flat = self.net_activation(x_flat)
-            x_flat = F.dropout(x_flat, p=0.2, training=self.training)
 
         uncertainty = self.softplus(self.uncertainty_head(x_flat)) + 1e-4
-        latent = torch.tanh(self.latent_head(x_flat))
 
         uncertainty = uncertainty.view(b, h, w)
-        latent = latent.view(b, h, w, self.latent_dim)
 
         if not batched:
             uncertainty = uncertainty.squeeze(0)
-            latent = latent.squeeze(0)
 
-        return uncertainty, latent
+        return uncertainty
 
 
 def generate_uncertainty_mlp(
@@ -95,7 +87,6 @@ def generate_uncertainty_mlp(
     network = MLPNetwork(
         input_dim=n_features,
         hidden_dim=hidden_dim,
-        latent_dim=latent_dim,
         net_depth=net_depth,
     ).cuda()
     return network

@@ -127,7 +127,13 @@ class DepthVideo:
             weights_only=True,
         )
         if isinstance(state, dict):
-            self.uncer_network.load_state_dict(state)
+            model_state = self.uncer_network.state_dict()
+            filtered = {
+                key: value
+                for key, value in state.items()
+                if key in model_state and model_state[key].shape == value.shape
+            }
+            self.uncer_network.load_state_dict(filtered, strict=False)
             self._uncer_checkpoint_mtime = mtime
 
     def export_keyframe_snapshot(self, index: int) -> Dict[str, Any]:
@@ -277,8 +283,13 @@ class DepthVideo:
             feature = self.get_dino_feature(index, resized=True)
             if feature is not None:
                 with torch.no_grad():
-                    uncertainty, _ = self.uncer_network(feature.unsqueeze(0).to(self.device))
-                return uncertainty.squeeze(0).detach()
+                    uncertainty = self.uncer_network(feature.unsqueeze(0).to(self.device))
+                if uncertainty.dim() == 3 and uncertainty.shape[0] == 1:
+                    uncertainty = uncertainty[0]
+                return uncertainty.detach()
+
+        if self.uncer_network is not None:
+            return None
 
         if bool(self.external_beta_valid[index].item()):
             return self.external_beta[index].clone().to(self.device)

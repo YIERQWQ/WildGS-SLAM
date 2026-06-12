@@ -154,7 +154,7 @@ def get_loss_mapping_uncertainty(
     train_frac: float,
     ssim_frac: float,
     initialization: bool = False,
-    freeze_uncertainty_loss: bool = False,  # Renamed parameter
+    freeze_uncertainty_loss: bool = False,  # Kept for backward compatibility
     uncertainty_override: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Compute mapping loss with uncertainty estimation for SLAM system.
@@ -202,13 +202,12 @@ def get_loss_mapping_uncertainty(
 
     if uncertainty_override is None:
         raise RuntimeError(
-            "Missing DINOv3 beta for mapping loss. "
-            "beta must be provided by the external service."
+            "Missing student uncertainty for mapping loss."
         )
-    uncertainty = uncertainty_override.to(device=rendered_img.device)
+    uncertainty = uncertainty_override.detach().to(device=rendered_img.device)
 
      # Compute mapping losses with uncertainty
-    uncer_loss, uncer_resized, l1_rgb, l1_depth = map_utils.compute_mapping_loss_components(
+    _, uncer_resized, l1_rgb, l1_depth = map_utils.compute_mapping_loss_components(
         gt_img,
         rendered_img,
         ref_depth,
@@ -249,14 +248,10 @@ def get_loss_mapping_uncertainty(
     uncer_depth_mask = ref_depth < rendered_depth.detach() + 1.0
     l1_depth[uncer_depth_mask] = weights[uncer_depth_mask] * l1_depth[uncer_depth_mask]
 
-    if freeze_uncertainty_loss:
-        uncer_loss = uncer_loss.detach()
-
     # Combine all losses
     total_loss = (
         alpha * rgb_loss.mean() +
-        (1 - alpha) * l1_depth.mean() +
-        config["uncertainty_params"]["ssim_mult"] * uncer_loss.mean()
+        (1 - alpha) * l1_depth.mean()
     )
 
     return uncertainty, total_loss

@@ -1,0 +1,1 @@
+现在需要teacher 初始化彻底从 RGB 脱钩，teacher 由 3D Gaussian field 学出来，student 用 DINOv3 特征去追它，uncertainty 学 residual，而不是之前的空壳，你直接改代码（进入到wildgs-slam里面），看到什么就改，不要等全部思考完了再改！永远思考不完！我核心就是要实现LUDVIG 风格的“2D → 3D uplift

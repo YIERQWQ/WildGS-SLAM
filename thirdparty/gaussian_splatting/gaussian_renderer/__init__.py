@@ -113,11 +113,15 @@ def render(
             shs = pc.get_features
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
     if mask is not None:
-        rendered_image, radii, depth, opacity = rasterizer(
+        shs_masked = shs[mask] if shs is not None else None
+        colors_precomp_masked = (
+            colors_precomp[mask] if colors_precomp is not None else None
+        )
+        rendered_image, radii, depth, opacity, n_touched = rasterizer(
             means3D=means3D[mask],
             means2D=means2D[mask],
-            shs=shs[mask],
-            colors_precomp=colors_precomp[mask] if colors_precomp is not None else None,
+            shs=shs_masked,
+            colors_precomp=colors_precomp_masked,
             opacities=opacity[mask],
             scales=scales[mask],
             rotations=rotations[mask],

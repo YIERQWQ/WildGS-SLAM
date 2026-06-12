@@ -130,18 +130,49 @@ class SLAM:
     def _uncertainty_ckpt_path(self) -> str:
         return os.path.join(self.save_dir, "uncertainty_student.pth")
 
+    @staticmethod
+    def _filter_legacy_uncertainty_state(state: dict, model: torch.nn.Module) -> dict:
+        model_state = model.state_dict()
+        filtered = {}
+        dropped = []
+        for key, value in state.items():
+            if key in model_state and model_state[key].shape == value.shape:
+                filtered[key] = value
+            else:
+                dropped.append(key)
+        return filtered, dropped
+
+    @staticmethod
+    def _safe_map_location(device):
+        if torch.cuda.is_available():
+            return device
+        return "cpu"
+
     def _load_uncertainty_checkpoint(self) -> None:
         if self.uncer_network is None:
             return
         ckpt_path = self._uncertainty_ckpt_path()
         if os.path.exists(ckpt_path):
-            state = torch.load(ckpt_path, map_location=self.device, weights_only=True)
+            state = torch.load(
+                ckpt_path,
+                map_location=self._safe_map_location(self.device),
+                weights_only=True,
+            )
             if isinstance(state, dict):
-                self.uncer_network.load_state_dict(state)
-                self.printer.print(
-                    f"Loaded uncertainty student checkpoint from {ckpt_path}",
-                    FontColor.INFO,
+                filtered, dropped = self._filter_legacy_uncertainty_state(
+                    state, self.uncer_network
                 )
+                self.uncer_network.load_state_dict(filtered, strict=False)
+                if dropped:
+                    self.printer.print(
+                        f"Loaded uncertainty student checkpoint from {ckpt_path} with filtered keys: {dropped}",
+                        FontColor.INFO,
+                    )
+                else:
+                    self.printer.print(
+                        f"Loaded uncertainty student checkpoint from {ckpt_path}",
+                        FontColor.INFO,
+                    )
 
     def _load_tracker_stats(self):
         candidates = [os.path.join(self.save_dir, "tracker_metrics.json")]
@@ -255,10 +286,15 @@ class SLAM:
 
     def load_pretrained(self, cfg):
         droid_pretrained = cfg["tracking"]["pretrained"]
+        map_location = self._safe_map_location(self.device)
         state_dict = OrderedDict(
             [
                 (k.replace("module.", ""), v)
-                for (k, v) in torch.load(droid_pretrained, weights_only=True).items()
+                for (k, v) in torch.load(
+                    droid_pretrained,
+                    map_location=map_location,
+                    weights_only=True,
+                ).items()
             ]
         )
         state_dict["update.weight.2.weight"] = state_dict["update.weight.2.weight"][:2]

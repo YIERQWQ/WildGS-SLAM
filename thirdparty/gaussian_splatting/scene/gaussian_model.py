@@ -37,6 +37,13 @@ class GaussianModel:
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
         self.teacher_feat_dim = 3
+        if config is not None:
+            self.teacher_feat_dim = int(
+                config["mapping"]["uncertainty_params"].get(
+                    "teacher_feature_dim",
+                    config["mapping"]["uncertainty_params"].get("feature_dim", 3),
+                )
+            )
 
         self._xyz = torch.empty(0, device="cuda")
         self._features_dc = torch.empty(0, device="cuda")
@@ -229,9 +236,87 @@ class GaussianModel:
             )
         )
 
-        teacher_latent = torch.tanh(fused_color.clone())
+        # The teacher latent is learned in 3D from feature uplift, not seeded from RGB.
+        teacher_latent = self._init_teacher_latent_from_camera(
+            cam, fused_point_cloud
+        )
 
         return fused_point_cloud, features, teacher_latent, scales, rots, opacities
+
+    def _feature_map_to_hwc(self, feature_map: torch.Tensor) -> torch.Tensor:
+        if feature_map is None:
+            return None
+        if feature_map.dim() == 4 and feature_map.shape[0] == 1:
+            feature_map = feature_map[0]
+        if feature_map.dim() != 3:
+            raise ValueError(f"Unsupported teacher feature shape: {tuple(feature_map.shape)}")
+        if feature_map.shape[-1] == self.teacher_feat_dim:
+            return feature_map.contiguous()
+        if feature_map.shape[0] == self.teacher_feat_dim:
+            return feature_map.permute(1, 2, 0).contiguous()
+        if feature_map.shape[-1] <= feature_map.shape[0]:
+            return feature_map.contiguous()
+        return feature_map.permute(1, 2, 0).contiguous()
+
+    def _init_teacher_latent_from_camera(
+        self, cam, fused_point_cloud: torch.Tensor
+    ) -> torch.Tensor:
+        feature_map = getattr(cam, "features", None)
+        if feature_map is None:
+            return 0.01 * torch.randn(
+                fused_point_cloud.shape[0], self.teacher_feat_dim, device="cuda"
+            )
+
+        feature_map = self._feature_map_to_hwc(feature_map).to(
+            device=fused_point_cloud.device, dtype=torch.float32
+        )
+        feat_h, feat_w, feat_c = feature_map.shape
+        if feat_c != self.teacher_feat_dim:
+            if feat_c > 0:
+                self.teacher_feat_dim = feat_c
+            else:
+                return 0.01 * torch.randn(
+                    fused_point_cloud.shape[0], self.teacher_feat_dim, device=fused_point_cloud.device
+                )
+
+        cam_r = cam.R.to(device=fused_point_cloud.device, dtype=torch.float32)
+        cam_t = cam.T.to(device=fused_point_cloud.device, dtype=torch.float32)
+        points_cam = (cam_r @ fused_point_cloud.T).T + cam_t
+        depth = points_cam[:, 2].clamp_min(1e-6)
+
+        x = cam.fx * (points_cam[:, 0] / depth) + cam.cx
+        y = cam.fy * (points_cam[:, 1] / depth) + cam.cy
+        scale_x = float(feat_w) / max(float(cam.image_width), 1.0)
+        scale_y = float(feat_h) / max(float(cam.image_height), 1.0)
+        x = x * scale_x
+        y = y * scale_y
+
+        valid = (
+            (points_cam[:, 2] > 1e-6)
+            & (x >= 0.0)
+            & (x <= max(feat_w - 1, 0))
+            & (y >= 0.0)
+            & (y <= max(feat_h - 1, 0))
+        )
+
+        grid_x = 2.0 * (x / max(float(feat_w - 1), 1.0)) - 1.0
+        grid_y = 2.0 * (y / max(float(feat_h - 1), 1.0)) - 1.0
+        grid = torch.stack((grid_x, grid_y), dim=-1).view(1, -1, 1, 2)
+        sampled = F.grid_sample(
+            feature_map.permute(2, 0, 1).unsqueeze(0),
+            grid,
+            mode="bilinear",
+            align_corners=True,
+        ).squeeze(0).squeeze(-1).transpose(0, 1).contiguous()
+        if sampled.shape[1] != self.teacher_feat_dim:
+            sampled = sampled[:, : self.teacher_feat_dim]
+            if sampled.shape[1] < self.teacher_feat_dim:
+                pad = self.teacher_feat_dim - sampled.shape[1]
+                sampled = F.pad(sampled, (0, pad))
+
+        noise = 0.01 * torch.randn_like(sampled)
+        sampled = torch.where(valid.unsqueeze(-1), sampled, noise)
+        return sampled + 0.005 * torch.randn_like(sampled)
 
     def init_lr(self, spatial_lr_scale):
         self.spatial_lr_scale = spatial_lr_scale
@@ -475,7 +560,7 @@ class GaussianModel:
             for idx, attr_name in enumerate(teacher_names):
                 teacher_latent[:, idx] = np.asarray(plydata.elements[0][attr_name])
         else:
-            teacher_latent = np.zeros((xyz.shape[0], self.teacher_feat_dim))
+            teacher_latent = 0.01 * np.random.randn(xyz.shape[0], self.teacher_feat_dim)
 
         scale_names = [
             p.name

@@ -7,6 +7,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.patches as patches
 from typing import Optional, Tuple, Union
+from types import SimpleNamespace
 
 import cv2
 import torch
@@ -130,6 +131,12 @@ class Mapper(object):
         self.uncer_params = munchify(self.config["mapping"]["uncertainty_params"])
         self.uncertainty_aware = self.uncer_params["activate"]
         if self.uncertainty_aware:
+            self.teacher_feat_dim = int(
+                self.uncer_params.get(
+                    "teacher_feature_dim",
+                    self.uncer_params.get("feature_dim", 384),
+                )
+            )
             self.teacher_consistency_mult = self.uncer_params.get(
                 "teacher_consistency_mult", 0.25
             )
@@ -139,14 +146,10 @@ class Mapper(object):
             self.teacher_consistency_start = int(
                 self.uncer_params.get("teacher_consistency_start", 0)
             )
-            self.student_latent_dim = int(
-                self.uncer_params.get("latent_dim", 3)
-            )
             self.uncer_network = uncer_network if uncer_network is not None else slam.uncer_network
             if self.uncer_network is None:
                 self.uncer_network = generate_uncertainty_mlp(
                     self.uncer_params["feature_dim"],
-                    latent_dim=self.student_latent_dim,
                     hidden_dim=int(self.uncer_params.get("hidden_dim", 128)),
                     net_depth=int(self.uncer_params.get("net_depth", 2)),
                 )
@@ -160,6 +163,7 @@ class Mapper(object):
 
             self.vis_uncertainty_online = self.uncer_params["vis_uncertainty_online"]
             self.video.set_uncer_network(self.uncer_network)
+            self.teacher_consistency_mult = float(self.teacher_consistency_mult)
 
         # Setup queue object for gui communication
         self.q_main2vis = q_main2vis
@@ -205,51 +209,377 @@ class Mapper(object):
 
     def _predict_student_uncertainty(
         self, features: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        uncertainty, latent = self.uncer_network(features.to(self.device))
+    ) -> torch.Tensor:
+        uncertainty = self.uncer_network(features.to(self.device))
         uncertainty = torch.clamp(uncertainty, min=0.1) + 1e-3
-        return uncertainty, latent
+        return uncertainty
+
+    def _get_dino_feature(
+        self, viewpoint: Camera, resized: bool = True
+    ) -> Optional[torch.Tensor]:
+        frame_id = int(self.video.timestamp[viewpoint.uid].item())
+        return self.video.get_dino_feature(
+            viewpoint.uid, resized=resized, frame_id=frame_id
+        )
+
+    @staticmethod
+    def _feature_map_to_hwc(feature_map: torch.Tensor, channels: int) -> torch.Tensor:
+        if feature_map.dim() == 4 and feature_map.shape[0] == 1:
+            feature_map = feature_map[0]
+        if feature_map.dim() != 3:
+            raise ValueError(f"Unsupported feature map shape: {tuple(feature_map.shape)}")
+        if feature_map.shape[-1] == channels:
+            return feature_map.contiguous()
+        if feature_map.shape[0] == channels:
+            return feature_map.permute(1, 2, 0).contiguous()
+        if feature_map.shape[0] == 3:
+            return feature_map.permute(1, 2, 0).contiguous()
+        raise ValueError(f"Cannot interpret feature map shape {tuple(feature_map.shape)} with channels={channels}")
+
+    @staticmethod
+    def _expand_rgb_feature_map(feature_map: torch.Tensor, target_channels: int) -> torch.Tensor:
+        if feature_map.dim() != 3:
+            raise ValueError(f"Unsupported RGB teacher shape: {tuple(feature_map.shape)}")
+        if feature_map.shape[-1] == target_channels:
+            return feature_map.contiguous()
+        if feature_map.shape[-1] == 3 and target_channels % 3 == 0:
+            repeat = target_channels // 3
+            return feature_map.repeat(1, 1, repeat).contiguous()
+        if feature_map.shape[0] == 3 and target_channels % 3 == 0:
+            repeat = target_channels // 3
+            return feature_map.permute(1, 2, 0).repeat(1, 1, repeat).contiguous()
+        return feature_map[..., :target_channels].contiguous()
+
+    def _resize_feature_map(
+        self, feature_map: torch.Tensor, target_hw: Tuple[int, int], channels: int
+    ) -> torch.Tensor:
+        feature_hwc = self._feature_map_to_hwc(feature_map, channels)
+        if feature_hwc.shape[:2] == target_hw:
+            return feature_hwc
+        return F.interpolate(
+            feature_hwc.permute(2, 0, 1).unsqueeze(0),
+            size=target_hw,
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0).permute(1, 2, 0).contiguous()
+
+    def _resize_scalar_map(
+        self, tensor: torch.Tensor, target_hw: Tuple[int, int]
+    ) -> torch.Tensor:
+        if tensor.shape == target_hw:
+            return tensor
+        return F.interpolate(
+            tensor.unsqueeze(0).unsqueeze(0),
+            size=target_hw,
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0).squeeze(0)
+
+    @staticmethod
+    def _feature_render_viewpoint(viewpoint: Camera, target_hw: Tuple[int, int]):
+        target_h, target_w = int(target_hw[0]), int(target_hw[1])
+        return SimpleNamespace(
+            image_height=target_h,
+            image_width=target_w,
+            FoVx=viewpoint.FoVx,
+            FoVy=viewpoint.FoVy,
+            world_view_transform=viewpoint.world_view_transform,
+            full_proj_transform=viewpoint.full_proj_transform,
+            projection_matrix=viewpoint.projection_matrix,
+            camera_center=viewpoint.camera_center,
+            cam_rot_delta=viewpoint.cam_rot_delta,
+            cam_trans_delta=viewpoint.cam_trans_delta,
+        )
+
+    def _feature_residual_map(
+        self,
+        teacher_features: torch.Tensor,
+        dino_features: torch.Tensor,
+        opacity: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        teacher_features = self._feature_map_to_hwc(teacher_features, self.teacher_feat_dim)
+        dino_features = self._feature_map_to_hwc(dino_features, self.uncer_params["feature_dim"])
+        if teacher_features.shape[:2] != dino_features.shape[:2]:
+            teacher_features = self._resize_feature_map(
+                teacher_features,
+                dino_features.shape[:2],
+                self.teacher_feat_dim,
+            )
+
+        residual = (teacher_features - dino_features).abs().mean(dim=-1)
+
+        opacity = opacity.detach()
+        if opacity.dim() == 3 and opacity.shape[0] == 1:
+            opacity = opacity.squeeze(0)
+        if opacity.shape != residual.shape:
+            opacity = self._resize_scalar_map(opacity, residual.shape)
+
+        if mask is not None:
+            if mask.shape != residual.shape:
+                mask = F.interpolate(
+                    mask.float().unsqueeze(0).unsqueeze(0),
+                    size=residual.shape,
+                    mode="nearest",
+                ).squeeze(0).squeeze(0) > 0.5
+            residual = residual * mask.float()
+        return residual * opacity
+
+    def _teacher_residual_map_from_gaussians(
+        self,
+        viewpoint: Camera,
+        dino_features: torch.Tensor,
+        opacity: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        render_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        dino_features = self._feature_map_to_hwc(
+            dino_features, self.uncer_params["feature_dim"]
+        )
+        dino_features = dino_features.to(self.device)
+        target_hw = dino_features.shape[:2]
+        teacher_render_scale = max(
+            1, int(self.uncer_params.get("teacher_render_scale", 2))
+        )
+        render_hw = (
+            max(1, target_hw[0] // teacher_render_scale),
+            max(1, target_hw[1] // teacher_render_scale),
+        )
+        dino_render_features = dino_features
+        if render_hw != target_hw:
+            dino_render_features = self._resize_feature_map(
+                dino_features,
+                render_hw,
+                self.uncer_params["feature_dim"],
+            )
+
+        opacity = opacity.detach()
+        if opacity.dim() == 3 and opacity.shape[0] == 1:
+            opacity = opacity.squeeze(0)
+        if opacity.shape != render_hw:
+            opacity = self._resize_scalar_map(opacity, render_hw)
+
+        if mask is not None:
+            if mask.shape != render_hw:
+                mask = F.interpolate(
+                    mask.float().unsqueeze(0).unsqueeze(0),
+                    size=render_hw,
+                    mode="nearest",
+                ).squeeze(0).squeeze(0) > 0.5
+            mask = mask.float()
+
+        teacher_latent = self.gaussians.get_teacher_latent
+        if teacher_latent is None or teacher_latent.numel() == 0:
+            render_view = self._feature_render_viewpoint(viewpoint, target_hw)
+            fallback_rgb = render(
+                render_view,
+                self.gaussians,
+                self.pipeline_params,
+                self.background,
+                override_color=self.gaussians.get_features[:, :3, 0],
+                mask=render_mask,
+            )["render"].permute(1, 2, 0).contiguous()
+            fallback_rgb = self._expand_rgb_feature_map(
+                fallback_rgb, self.teacher_feat_dim
+            )
+            return self._feature_residual_map(
+                fallback_rgb,
+                dino_render_features,
+                opacity,
+                mask=mask.bool() if mask is not None else None,
+            )
+
+        teacher_dim = min(self.teacher_feat_dim, dino_render_features.shape[-1])
+        num_chunks = max(1, (teacher_dim + 2) // 3)
+        residual_sum = torch.zeros(
+            render_hw,
+            device=dino_features.device,
+            dtype=dino_features.dtype,
+        )
+        total_channels = 0
+
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * 3
+            end = min(start + 3, teacher_dim)
+            if start >= end:
+                break
+
+            chunk = teacher_latent[:, start:end]
+            if chunk.shape[1] < 3:
+                chunk = F.pad(chunk, (0, 3 - chunk.shape[1]))
+
+            render_view = self._feature_render_viewpoint(viewpoint, render_hw)
+            render_pkg = render(
+                render_view,
+                self.gaussians,
+                self.pipeline_params,
+                self.background,
+                override_color=chunk,
+                mask=render_mask,
+            )
+            teacher_chunk = render_pkg["render"].permute(1, 2, 0).contiguous()
+
+            dino_chunk = dino_render_features[..., start:end]
+            if teacher_chunk.shape[-1] != dino_chunk.shape[-1]:
+                teacher_chunk = teacher_chunk[..., : dino_chunk.shape[-1]]
+
+            chunk_residual = (teacher_chunk - dino_chunk).abs().mean(dim=-1)
+            if mask is not None:
+                chunk_residual = chunk_residual * mask
+
+            residual_sum = residual_sum + chunk_residual * float(end - start)
+            total_channels += end - start
+
+            del render_pkg, teacher_chunk, dino_chunk, chunk_residual, chunk
+
+        if total_channels <= 0:
+            residual = torch.zeros_like(residual_sum)
+        else:
+            residual = residual_sum / float(total_channels)
+
+        residual = residual * opacity
+        if render_hw != target_hw:
+            residual = F.interpolate(
+                residual.unsqueeze(0).unsqueeze(0),
+                size=target_hw,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0).squeeze(0)
+        return residual
+
+    def _student_uncertainty_for_viewpoint(self, viewpoint: Camera) -> Optional[torch.Tensor]:
+        if not self.uncertainty_aware or self.uncer_network is None:
+            return None
+        dino_feature = self._get_dino_feature(viewpoint, resized=True)
+        if dino_feature is None:
+            dino_feature = viewpoint.features
+        if dino_feature is None:
+            return None
+        uncertainty = self._predict_student_uncertainty(dino_feature)
+        if uncertainty.dim() == 3 and uncertainty.shape[0] == 1:
+            uncertainty = uncertainty[0]
+        return uncertainty
+
+    def _teacher_residual_weighted_loss(
+        self,
+        teacher_residual: torch.Tensor,
+        uncertainty: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        if not self.uncertainty_aware:
+            return None
+        if uncertainty is None:
+            return None
+        residual = teacher_residual.to(device=uncertainty.device)
+        if residual.shape != uncertainty.shape:
+            residual = self._resize_scalar_map(residual, uncertainty.shape)
+        weights = 0.5 / (torch.clamp(uncertainty.detach(), min=0.1) + 1e-3) ** 2
+        weights = torch.where(weights < 0.1, 0.0, weights)
+        teacher_loss = (weights * residual.pow(2)).mean()
+        return teacher_loss
+
+    @torch.no_grad()
+    def _student_uncertainty_for_viewpoint(
+        self, viewpoint: Camera
+    ) -> Optional[torch.Tensor]:
+        if not self.uncertainty_aware or self.uncer_network is None:
+            return None
+        dino_feature = self._get_dino_feature(viewpoint, resized=True)
+        if dino_feature is None:
+            dino_feature = viewpoint.features
+        if dino_feature is None:
+            return None
+        uncertainty = self.uncer_network(dino_feature.to(self.device))
+        if uncertainty.dim() == 3 and uncertainty.shape[0] == 1:
+            uncertainty = uncertainty[0]
+        return uncertainty.detach()
+
+    @torch.no_grad()
+    def _student_uncertainty_from_features(
+        self, features: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if not self.uncertainty_aware or self.uncer_network is None or features is None:
+            return None
+        uncertainty = self.uncer_network(features.to(self.device))
+        if uncertainty.dim() == 3 and uncertainty.shape[0] == 1:
+            uncertainty = uncertainty[0]
+        return uncertainty.detach()
 
     def _teacher_latent_from_gaussians(
         self, viewpoint: Camera, fallback_features: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        render_pkg = render(
+        teacher_chunks = []
+        teacher_latent = self.gaussians.get_teacher_latent
+        if teacher_latent is None or teacher_latent.numel() == 0:
+            fallback_rgb = render(
+                viewpoint,
+                self.gaussians,
+                self.pipeline_params,
+                self.background,
+                override_color=self.gaussians.get_features[:, :3, 0],
+            )["render"].permute(1, 2, 0).contiguous()
+            fallback_rgb = self._expand_rgb_feature_map(
+                fallback_rgb, self.teacher_feat_dim
+            )
+            return fallback_rgb.permute(2, 0, 1).contiguous()
+
+        num_chunks = max(1, (self.teacher_feat_dim + 2) // 3)
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * 3
+            end = min(start + 3, self.teacher_feat_dim)
+            if start >= end:
+                break
+            chunk = teacher_latent[:, start:end]
+            if chunk.shape[1] < 3:
+                chunk = F.pad(chunk, (0, 3 - chunk.shape[1]))
+            render_pkg = render(
+                viewpoint,
+                self.gaussians,
+                self.pipeline_params,
+                self.background,
+                override_color=chunk,
+            )
+            teacher_chunks.append(render_pkg["render"])
+
+        teacher_latent_map = torch.cat(teacher_chunks, dim=0)
+        return teacher_latent_map[: self.teacher_feat_dim].permute(1, 2, 0).contiguous()
+
+    def _teacher_student_uplift_loss(
+        self, viewpoint: Camera, render_pkg: dict
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if not self.uncertainty_aware or self.uncer_network is None:
+            return None
+
+        dino_feature = self._get_dino_feature(viewpoint, resized=True)
+        if dino_feature is None:
+            dino_feature = viewpoint.features
+        if dino_feature is None:
+            return None
+
+        mask = render_pkg["opacity"].detach().squeeze(0) > self.uncer_params[
+            "opacity_th_for_uncer_loss"
+        ]
+        render_mask = render_pkg.get("visibility_filter", None)
+        opacity = render_pkg["opacity"]
+        del render_pkg
+        teacher_map = self._teacher_residual_map_from_gaussians(
             viewpoint,
-            self.gaussians,
-            self.pipeline_params,
-            self.background,
-            override_color=self.gaussians.get_teacher_latent,
+            dino_feature,
+            opacity,
+            mask=mask,
+            render_mask=render_mask,
         )
-        teacher_latent = render_pkg["render"]
-        if teacher_latent.dim() == 3 and teacher_latent.shape[0] in (1, 3):
-            return teacher_latent
-        if teacher_latent.dim() == 3 and teacher_latent.shape[-1] in (1, 3):
-            return teacher_latent.permute(2, 0, 1).contiguous()
-        raise ValueError(f"Unexpected teacher render shape: {teacher_latent.shape}")
+        uncertainty = self._predict_student_uncertainty(dino_feature)
+        if uncertainty.dim() == 3 and uncertainty.shape[0] == 1:
+            uncertainty = uncertainty[0]
+        student_loss = F.smooth_l1_loss(uncertainty, teacher_map.detach())
+        teacher_loss = self._teacher_residual_weighted_loss(teacher_map, uncertainty)
+        if teacher_loss is None:
+            return None
+        return uncertainty, teacher_map, teacher_loss, student_loss
 
-    def _teacher_student_consistency_loss(
-        self,
-        student_latent: torch.Tensor,
-        teacher_latent: torch.Tensor,
-        opacity: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        reduce: bool = True,
-    ) -> torch.Tensor:
-        teacher_latent = teacher_latent.to(student_latent.device)
-        if teacher_latent.dim() == 3 and teacher_latent.shape[0] == student_latent.shape[-1]:
-            teacher_latent = teacher_latent.permute(1, 2, 0).contiguous()
-        if teacher_latent.dim() != 3:
-            raise ValueError(f"Unexpected teacher latent shape: {teacher_latent.shape}")
-        if student_latent.dim() != 3:
-            raise ValueError(f"Unexpected student latent shape: {student_latent.shape}")
-
-        student_latent = F.normalize(student_latent, p=2, dim=-1)
-        teacher_latent = F.normalize(teacher_latent, p=2, dim=-1)
-        diff = 1.0 - (student_latent * teacher_latent).sum(dim=-1)
-        if mask is not None:
-            diff = diff * mask.float()
-        diff = diff * opacity.squeeze(0)
-        return diff.mean() if reduce else diff
+    @staticmethod
+    def _detach_teacher_latent(teacher_latent: torch.Tensor) -> torch.Tensor:
+        return teacher_latent.detach()
 
     def _maybe_update_student_from_keyframe(
         self,
@@ -261,62 +591,20 @@ class Mapper(object):
             return None
 
         frame_id = int(self.video.timestamp[viewpoint.uid].item())
-        features = viewpoint.features
-        if features is None:
+        uplift = self._teacher_student_uplift_loss(viewpoint, render_pkg)
+        if uplift is None:
             return None
+        uncertainty, teacher_map, teacher_loss, student_loss = uplift
 
-        uncertainty, student_latent = self._predict_student_uncertainty(features)
-        teacher_latent = self._teacher_latent_from_gaussians(viewpoint)
-        teacher_latent = teacher_latent.permute(1, 2, 0).contiguous()
-        if student_latent.dim() == 4:
-            student_latent = student_latent.squeeze(0)
-        if student_latent.shape[:2] != teacher_latent.shape[:2]:
-            student_latent = F.interpolate(
-                student_latent.permute(2, 0, 1).unsqueeze(0),
-                size=teacher_latent.shape[:2],
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(0).permute(1, 2, 0).contiguous()
-        uncertainty = F.interpolate(
-            uncertainty.unsqueeze(0).unsqueeze(0),
-            size=teacher_latent.shape[:2],
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0).squeeze(0)
-
-        mask = render_pkg["opacity"].detach().squeeze(0) > self.uncer_params[
-            "opacity_th_for_uncer_loss"
-        ]
-        teacher_map = self._teacher_student_consistency_loss(
-            student_latent.detach(),
-            teacher_latent,
-            render_pkg["opacity"],
-            mask=mask,
-            reduce=False,
-        )
-        student_map = self._teacher_student_consistency_loss(
-            student_latent,
-            teacher_latent.detach(),
-            render_pkg["opacity"],
-            mask=mask,
-            reduce=False,
-        )
-        teacher_loss = teacher_map.mean()
-        student_loss = student_map.mean()
-
-        uncertainty_loss = F.smooth_l1_loss(uncertainty, teacher_map.detach())
-
-        if frame_id >= self.teacher_consistency_start and (
-            frame_id % self.teacher_consistency_interval == 0
+        if (
+            frame_id >= self.teacher_consistency_start
+            and frame_id % self.teacher_consistency_interval == 0
         ):
+            total = teacher_loss + self.teacher_consistency_mult * student_loss
             self.gaussians.optimizer.zero_grad(set_to_none=True)
-            teacher_loss.backward(retain_graph=True)
-            self.gaussians.optimizer.step()
-            self.gaussians.optimizer.zero_grad(set_to_none=True)
-
-            total = student_loss + self.teacher_consistency_mult * uncertainty_loss
             self.uncer_optimizer.zero_grad(set_to_none=True)
             total.backward()
+            self.gaussians.optimizer.step()
             self.uncer_optimizer.step()
 
         return uncertainty.detach()
@@ -1046,24 +1334,21 @@ class Mapper(object):
         # Using uncertainty only when uncertainty-aware tracking is activated
         if self.video.uncertainty_aware:
             with torch.no_grad():
-                keyframe_idx = self.video._frame_id_to_index(frame_idx)
-                if keyframe_idx is not None:
-                    uncer = self.video.get_external_beta(
-                        keyframe_idx,
-                        frame_id=frame_idx,
-                    )
+                uncer = self._student_uncertainty_from_features(features)
+                if uncer is None:
+                    uncer_resized = None
                 else:
-                    uncer = self.video.interpolate_external_beta(frame_idx)
-                uncer = torch.clip(uncer, min=0.1) + 1e-3
-                uncer_resized = F.interpolate(
-                    uncer.unsqueeze(0).unsqueeze(0),
-                    size=color.shape[-2:],
-                    mode="bilinear",
-                ).squeeze()
-                data_rate = 1 + 1 * map_utils.compute_bias_factor(
-                    self.config["mapping"]["uncertainty_params"]["train_frac_fix"], 0.8
-                )
-                uncer_resized = (uncer_resized - 0.1) * data_rate + 0.1
+                    uncer = torch.clip(uncer, min=0.1) + 1e-3
+                    uncer_resized = F.interpolate(
+                        uncer.unsqueeze(0).unsqueeze(0),
+                        size=color.shape[-2:],
+                        mode="bilinear",
+                    ).squeeze()
+                if uncer_resized is not None:
+                    data_rate = 1 + 1 * map_utils.compute_bias_factor(
+                        self.config["mapping"]["uncertainty_params"]["train_frac_fix"], 0.8
+                    )
+                    uncer_resized = (uncer_resized - 0.1) * data_rate + 0.1
         else:
             uncer_resized = None
 
@@ -1183,46 +1468,59 @@ class Mapper(object):
                     initialization=True,
                 )
             else:
-                train_frac = self.uncer_params["train_frac_fix"]
-                ssim_frac = self.uncer_params["train_frac_fix"]
-                if self.config["mapping"]["full_resolution"]:
-                    depth = F.interpolate(
-                        depth.unsqueeze(0), viewpoint.depth.shape, mode="bicubic"
-                    ).squeeze(0)
-                current_uncertainty, loss_init = get_loss_mapping_uncertainty(
-                    self.config["mapping"],
-                    image,
-                    depth,
-                    viewpoint,
-                    opacity,
-                    train_frac,
-                    ssim_frac,
-                    initialization=True,
-                    uncertainty_override=self.video.get_external_beta(
-                        kf_idx,
-                        frame_id=frame_idx,
-                    ),
-                )
+                uplift = self._teacher_student_uplift_loss(viewpoint, render_pkg)
+                if uplift is None:
+                    current_uncertainty = self._student_uncertainty_for_viewpoint(viewpoint)
+                    loss_init = get_loss_mapping(
+                        self.config["mapping"],
+                        image,
+                        depth,
+                        viewpoint,
+                        opacity,
+                        initialization=True,
+                    )
+                    teacher_loss = None
+                    student_loss = None
+                else:
+                    current_uncertainty, _, teacher_loss, student_loss = uplift
+                    train_frac = self.uncer_params["train_frac_fix"]
+                    ssim_frac = self.uncer_params["train_frac_fix"]
+                    if self.config["mapping"]["full_resolution"]:
+                        depth = F.interpolate(
+                            depth.unsqueeze(0), viewpoint.depth.shape, mode="bicubic"
+                        ).squeeze(0)
+                    current_uncertainty, loss_init = get_loss_mapping_uncertainty(
+                        self.config["mapping"],
+                        image,
+                        depth,
+                        viewpoint,
+                        opacity,
+                        train_frac,
+                        ssim_frac,
+                        initialization=True,
+                        uncertainty_override=current_uncertainty,
+                    )
+                    loss_init += teacher_loss + self.teacher_consistency_mult * student_loss
 
-                stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
-                feature = viewpoint.features.to(device=image.device)
-                current_uncertainty = F.interpolate(
-                    current_uncertainty.unsqueeze(0).unsqueeze(0),
-                    size=feature.shape[:2],
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(0).squeeze(0)
-                feature_buffer = [
-                    feature[::stride, ::stride],
-                ]
-                uncer_buffer = [
-                    current_uncertainty[::stride, ::stride].unsqueeze(-1),
-                ]
-                loss_init += self.config["mapping"]["uncertainty_params"][
-                    "reg_mult"
-                ] * map_utils.compute_dino_regularization_loss(
-                    uncer_buffer, feature_buffer
-                )
+                    stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
+                    feature = viewpoint.features.to(device=image.device)
+                    current_uncertainty = F.interpolate(
+                        current_uncertainty.unsqueeze(0).unsqueeze(0),
+                        size=feature.shape[:2],
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0).squeeze(0)
+                    feature_buffer = [
+                        feature[::stride, ::stride],
+                    ]
+                    uncer_buffer = [
+                        current_uncertainty[::stride, ::stride].unsqueeze(-1),
+                    ]
+                    loss_init += self.config["mapping"]["uncertainty_params"][
+                        "reg_mult"
+                    ] * map_utils.compute_dino_regularization_loss(
+                        uncer_buffer, feature_buffer
+                    )
 
             scaling = self.gaussians.get_scaling
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
@@ -1253,6 +1551,8 @@ class Mapper(object):
 
                 self.gaussians.optimizer.step()
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
+                self.uncer_optimizer.step()
+                self.uncer_optimizer.zero_grad(set_to_none=True)
                 self.gaussians.update_learning_rate(self.iteration_count)
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
@@ -1343,28 +1643,37 @@ class Mapper(object):
                     self.config["mapping"], image, depth, viewpoint, opacity
                 )
             else:
-                train_frac = self.uncer_params["train_frac_fix"]
-                ssim_frac = self.uncer_params["train_frac_fix"]
+                uplift = self._teacher_student_uplift_loss(viewpoint, render_pkg)
+                if uplift is None:
+                    current_uncertainty = self._student_uncertainty_for_viewpoint(viewpoint)
+                    current_loss_mapping = get_loss_mapping(
+                        self.config["mapping"], image, depth, viewpoint, opacity
+                    )
+                    teacher_loss = None
+                    student_loss = None
+                else:
+                    current_uncertainty, _, teacher_loss, student_loss = uplift
+                    train_frac = self.uncer_params["train_frac_fix"]
+                    ssim_frac = self.uncer_params["train_frac_fix"]
+                    (
+                        current_uncertainty,
+                        current_loss_mapping,
+                    ) = get_loss_mapping_uncertainty(
+                        self.config["mapping"],
+                        (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b,
+                        depth,
+                        viewpoint,
+                        opacity,
+                        train_frac,
+                        ssim_frac,
+                        initialization=False,
+                        uncertainty_override=current_uncertainty,
+                    )
+                    current_uncertainty = current_uncertainty.detach()
 
-                (
-                    current_uncertainty,
-                    current_loss_mapping,
-                ) = get_loss_mapping_uncertainty(
-                    self.config["mapping"],
-                    (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b,
-                    depth,
-                    viewpoint,
-                    opacity,
-                    train_frac,
-                    ssim_frac,
-                    freeze_uncertainty_loss=self.iterations_after_densify_or_reset < 20,
-                    uncertainty_override=self.video.get_external_beta(
-                        viewpoint.uid,
-                        frame_id=viewpoint.uid,
-                    ),
-                )
                 loss_mapping += current_loss_mapping
-                current_uncertainty = current_uncertainty.detach()
+                if teacher_loss is not None and student_loss is not None:
+                    loss_mapping += teacher_loss + self.teacher_consistency_mult * student_loss
 
                 # Dino_regularization loss
                 if self.iterations_after_densify_or_reset >= 20:
@@ -1381,10 +1690,9 @@ class Mapper(object):
                     for reg_view in reg_viewpoints:
                         reg_feature = reg_view.features.to(device=image.device)
                         reg_feature_sample = reg_feature[::stride, ::stride]
-                        reg_beta = self.video.get_external_beta(
-                            reg_view.uid,
-                            frame_id=reg_view.uid,
-                        )
+                        reg_beta = self._student_uncertainty_for_viewpoint(reg_view)
+                        if reg_beta is None:
+                            continue
                         reg_beta = F.interpolate(
                             reg_beta.unsqueeze(0).unsqueeze(0),
                             size=reg_feature.shape[:2],
@@ -1393,9 +1701,10 @@ class Mapper(object):
                         ).squeeze(0).squeeze(0)
                         feature_buffer.append(reg_feature_sample)
                         uncer_buffer.append(reg_beta[::stride, ::stride].unsqueeze(-1))
-                    loss_mapping += reg_multi * map_utils.compute_dino_regularization_loss(
-                        uncer_buffer, feature_buffer
-                    )
+                    if feature_buffer and uncer_buffer:
+                        loss_mapping += reg_multi * map_utils.compute_dino_regularization_loss(
+                            uncer_buffer, feature_buffer
+                        )
 
             scaling = self.gaussians.get_scaling
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
@@ -1445,6 +1754,8 @@ class Mapper(object):
 
                 self.gaussians.optimizer.step()
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
+                self.uncer_optimizer.step()
+                self.uncer_optimizer.zero_grad(set_to_none=True)
                 self.gaussians.update_learning_rate(self.iteration_count)
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
@@ -1520,44 +1831,37 @@ class Mapper(object):
                     self.config["mapping"], image, depth, viewpoint, opacity
                 )
             else:
-                train_frac = self.uncer_params["train_frac_fix"]
-                ssim_frac = self.uncer_params["train_frac_fix"]
+                uplift = self._teacher_student_uplift_loss(viewpoint, render_pkg)
+                if uplift is None:
+                    current_uncertainty = self._student_uncertainty_for_viewpoint(viewpoint)
+                    loss_mapping_this_frame = get_loss_mapping(
+                        self.config["mapping"], image, depth, viewpoint, opacity
+                    )
+                    teacher_loss = None
+                    student_loss = None
+                else:
+                    current_uncertainty, _, teacher_loss, student_loss = uplift
+                    train_frac = self.uncer_params["train_frac_fix"]
+                    ssim_frac = self.uncer_params["train_frac_fix"]
+                    (
+                        current_uncertainty,
+                        loss_mapping_this_frame,
+                    ) = get_loss_mapping_uncertainty(
+                        self.config["mapping"],
+                        image,
+                        depth,
+                        viewpoint,
+                        opacity,
+                        train_frac,
+                        ssim_frac,
+                        initialization=False,
+                        uncertainty_override=current_uncertainty,
+                    )
+                    current_uncertainty = current_uncertainty.detach()
 
-                (
-                    current_uncertainty,
-                    loss_mapping_this_frame,
-                ) = get_loss_mapping_uncertainty(
-                    self.config["mapping"],
-                    image,
-                    depth,
-                    viewpoint,
-                    opacity,
-                    train_frac,
-                    ssim_frac,
-                    freeze_uncertainty_loss=self.iterations_after_densify_or_reset
-                    < 200,
-                    uncertainty_override=self.video.get_external_beta(
-                        viewpoint.uid,
-                        frame_id=viewpoint.uid,
-                    ),
-                )
                 loss_mapping += loss_mapping_this_frame
-                current_uncertainty = current_uncertainty.detach()
-
-                stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
-                current_feature = viewpoint.features.to(device=image.device)
-                current_uncertainty = F.interpolate(
-                    current_uncertainty.unsqueeze(0).unsqueeze(0),
-                    size=current_feature.shape[:2],
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(0).squeeze(0)
-                uncer_buffer.append(
-                    current_uncertainty[::stride, ::stride].unsqueeze(-1)
-                )
-                feature_buffer.append(
-                    current_feature[::stride, ::stride]
-                )
+                if teacher_loss is not None and student_loss is not None:
+                    loss_mapping += teacher_loss + self.teacher_consistency_mult * student_loss
 
             if self.uncertainty_aware and self.iterations_after_densify_or_reset >= 200:
                 stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
@@ -1574,10 +1878,9 @@ class Mapper(object):
                 for reg_view in reg_viewpoints:
                     reg_feature = reg_view.features.to(device=image.device)
                     reg_feature_sample = reg_feature[::stride, ::stride]
-                    reg_beta = self.video.get_external_beta(
-                        reg_view.uid,
-                        frame_id=reg_view.uid,
-                    )
+                    reg_beta = self._student_uncertainty_for_viewpoint(reg_view)
+                    if reg_beta is None:
+                        continue
                     reg_beta = F.interpolate(
                         reg_beta.unsqueeze(0).unsqueeze(0),
                         size=reg_feature.shape[:2],
@@ -1586,9 +1889,10 @@ class Mapper(object):
                     ).squeeze(0).squeeze(0)
                     feature_buffer.append(reg_feature_sample)
                     uncer_buffer.append(reg_beta[::stride, ::stride].unsqueeze(-1))
-                loss_mapping += reg_multi * map_utils.compute_dino_regularization_loss(
-                    uncer_buffer, feature_buffer
-                )
+                if feature_buffer and uncer_buffer:
+                    loss_mapping += reg_multi * map_utils.compute_dino_regularization_loss(
+                        uncer_buffer, feature_buffer
+                    )
 
             viewspace_point_tensor_acm.append(viewspace_point_tensor)
             visibility_filter_acm.append(visibility_filter)
@@ -1603,6 +1907,8 @@ class Mapper(object):
             with torch.no_grad():
                 self.gaussians.optimizer.step()
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
+                self.uncer_optimizer.step()
+                self.uncer_optimizer.zero_grad(set_to_none=True)
                 self.gaussians.update_learning_rate(self.iteration_count)
                 # Optimize the exposure compensation
                 self.keyframe_optimizers.step()
@@ -1677,11 +1983,13 @@ class Mapper(object):
         """
         Compute the uncertainty for a given viewpoint without gradient computation.
         """
-        frame_id = int(self.video.timestamp[viewpoint.uid].item())
-        uncertainty = self.video.get_external_beta(
-            viewpoint.uid,
-            frame_id=frame_id,
-        )
+        uncertainty = self._student_uncertainty_for_viewpoint(viewpoint)
+        if uncertainty is None:
+            uncertainty = torch.ones(
+                viewpoint.image_height // self.video.down_scale,
+                viewpoint.image_width // self.video.down_scale,
+                device=self.device,
+            )
 
         # Process uncertainty values
         uncertainty = torch.clip(uncertainty, min=0.1) + 1e-3

@@ -24,6 +24,7 @@ echo "[RUN] log_dir=${RUN_LOG_DIR}"
 BETA_HOST="127.0.0.1"
 BETA_PORT="5555"
 BETA_LOG="${RUN_LOG_DIR}/dino_beta_service.log"
+START_DINO_BETA="${START_DINO_BETA:-0}"
 
 port_is_open() {
     local host="$1"
@@ -47,10 +48,10 @@ wait_for_port() {
     done
 }
 
-if port_is_open "${BETA_HOST}" "${BETA_PORT}"; then
+if [ "${START_DINO_BETA}" = "1" ] && port_is_open "${BETA_HOST}" "${BETA_PORT}"; then
     echo "[DINO-BETA] Reusing existing service on ${BETA_HOST}:${BETA_PORT}"
     BETA_PID=""
-else
+elif [ "${START_DINO_BETA}" = "1" ]; then
     mkdir -p "$(dirname "${BETA_LOG}")"
     CUDA_VISIBLE_DEVICES=0 python src/utils/dino_beta_service.py \
         --device cuda:0 \
