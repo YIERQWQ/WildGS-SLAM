@@ -146,7 +146,7 @@ mono_prior:
   depth: 'metric3d_vit_large'
 
   # Available options: {dinov2_reg_small_fine, dinov2_small_fine} from fit3d, and {dinov2_vits14, dinov2_vits14_reg}
-  feature_extractor: 'dinov2_reg_small_fine' 
+  feature_extractor: 'dinov2_vits14_reg' #'dinov2_reg_small_fine' 
 
 data:
   output: ./output/wildgs_slam
